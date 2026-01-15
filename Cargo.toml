@@ -1,6 +1,9 @@
 [package]
 name = "x07-registry"
 version = "0.1.0"
+description = "X07 package registry server (API)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/x07lang/x07-registry"
 edition = "2021"
 
 [dependencies]

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ci / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test
+
+  openapi:
+    name: ci / openapi-validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate openapi JSON parses
+        run: python3 -m json.tool openapi/openapi.json >/dev/null
+

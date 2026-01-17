@@ -104,16 +104,19 @@ jobs:
       - test
       - s3-backend
       - openapi
+    env:
+      DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+      DO_REGISTRY_APP_ID: ${{ secrets.DO_REGISTRY_APP_ID }}
     if: >
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      secrets.DO_API_TOKEN != '' &&
-      secrets.DO_REGISTRY_APP_ID != ''
+      env.DO_API_TOKEN != '' &&
+      env.DO_REGISTRY_APP_ID != ''
     steps:
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
-          token: ${{ secrets.DO_API_TOKEN }}
+          token: ${{ env.DO_API_TOKEN }}
 
       - name: Trigger deployment
-        run: doctl apps create-deployment ${{ secrets.DO_REGISTRY_APP_ID }}
+        run: doctl apps create-deployment ${{ env.DO_REGISTRY_APP_ID }}

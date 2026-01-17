@@ -8,13 +8,85 @@ jobs:
   test:
     name: ci / test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
       - name: cargo test
+        env:
+          X07_REGISTRY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: cargo test
+
+  s3-backend:
+    name: ci / s3-backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minio \
+            -e MINIO_ROOT_PASSWORD=minio123 \
+            minio/minio:latest server /data
+
+      - name: Wait for MinIO
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs minio
+          exit 1
+
+      - name: cargo test (s3 backend)
+        env:
+          X07_REGISTRY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+          X07_REGISTRY_TEST_S3: "1"
+          X07_REGISTRY_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          X07_REGISTRY_TEST_S3_REGION: us-east-1
+          X07_REGISTRY_TEST_S3_BUCKET: x07-registry-ci
+          X07_REGISTRY_TEST_S3_FORCE_PATH_STYLE: "true"
+          X07_REGISTRY_TEST_S3_ACCESS_KEY_ID: minio
+          X07_REGISTRY_TEST_S3_SECRET_ACCESS_KEY: minio123
+        run: cargo test --test s3_backend
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio
 
   openapi:
     name: ci / openapi-validate
@@ -25,3 +97,23 @@ jobs:
       - name: Validate openapi JSON parses
         run: python3 -m json.tool openapi/openapi.json >/dev/null
 
+  deploy-do:
+    name: deploy / digitalocean-app-platform
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - s3-backend
+      - openapi
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      secrets.DO_API_TOKEN != '' &&
+      secrets.DO_REGISTRY_APP_ID != ''
+    steps:
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Trigger deployment
+        run: doctl apps create-deployment ${{ secrets.DO_REGISTRY_APP_ID }}

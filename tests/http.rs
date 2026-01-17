@@ -1,11 +1,33 @@
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 async fn read_body_json(body: axum::body::Body) -> Value {
     let bytes = body.collect().await.expect("collect body").to_bytes();
     serde_json::from_slice(&bytes).expect("parse json body")
+}
+
+async fn create_test_schema() -> (String, String) {
+    let database_url = std::env::var("X07_REGISTRY_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| "postgres://x07:x07@127.0.0.1:55432/x07_registry".to_string());
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&database_url)
+        .await
+        .expect("connect postgres");
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&pool)
+        .await
+        .expect("create schema");
+
+    (database_url, schema)
 }
 
 fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
@@ -34,7 +56,11 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
         header.set_gid(0);
         header.set_cksum();
         builder
-            .append_data(&mut header, "x07-package.json", std::io::Cursor::new(&manifest_bytes))
+            .append_data(
+                &mut header,
+                "x07-package.json",
+                std::io::Cursor::new(&manifest_bytes),
+            )
             .expect("append manifest");
 
         let mut header = tar::Header::new_gnu();
@@ -61,13 +87,25 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
 #[tokio::test]
 async fn healthz_is_ok() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
     let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
-        data_dir: tmp.path().to_path_buf(),
         public_base: "http://127.0.0.1:8080".to_string(),
-        auth_token: None,
-    });
+        database_url,
+        database_schema,
+        bootstrap_token: None,
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
     let resp = app
-        .oneshot(Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -76,11 +114,18 @@ async fn healthz_is_ok() {
 #[tokio::test]
 async fn index_config_is_ok() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
     let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
-        data_dir: tmp.path().to_path_buf(),
         public_base: "http://127.0.0.1:8080".to_string(),
-        auth_token: None,
-    });
+        database_url,
+        database_schema,
+        bootstrap_token: None,
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -93,18 +138,109 @@ async fn index_config_is_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = read_body_json(resp.into_body()).await;
     assert_eq!(json["auth-required"], Value::Bool(false));
+    assert_eq!(json["sparse"], Value::Bool(true));
     assert!(json["dl"].as_str().unwrap().ends_with("/v1/packages/"));
     assert!(json["api"].as_str().unwrap().ends_with("/v1/"));
 }
 
 #[tokio::test]
+async fn index_config_auth_required_is_false_even_when_publish_requires_token() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
+        public_base: "http://127.0.0.1:8080".to_string(),
+        database_url,
+        database_schema,
+        bootstrap_token: None,
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/index/config.json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["auth-required"], Value::Bool(false));
+    assert_eq!(json["sparse"], Value::Bool(true));
+}
+
+#[tokio::test]
+async fn cors_allows_configured_origin_for_get_requests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
+        public_base: "http://127.0.0.1:8080".to_string(),
+        database_url,
+        database_schema,
+        bootstrap_token: None,
+        cors_origins: vec!["https://x07.io".to_string()],
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://x07.io")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://x07.io"
+    );
+}
+
+#[tokio::test]
 async fn publish_creates_index_and_download() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
     let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
-        data_dir: tmp.path().to_path_buf(),
         public_base: "http://127.0.0.1:8080".to_string(),
-        auth_token: None,
-    });
+        database_url,
+        database_schema,
+        bootstrap_token: Some("bootstrap".to_string()),
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/bootstrap")
+                .header("Authorization", "Bearer bootstrap")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"tester"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let token = json["token"].as_str().expect("token str").to_string();
 
     let tar = make_tar_with_package("hello", "0.1.0");
     let resp = app
@@ -113,6 +249,7 @@ async fn publish_creates_index_and_download() {
             Request::builder()
                 .method("POST")
                 .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::from(tar.clone()))
                 .unwrap(),
         )
@@ -142,6 +279,32 @@ async fn publish_creates_index_and_download() {
     assert!(index_text.contains("\"name\":\"hello\""));
     assert!(index_text.contains("\"version\":\"0.1.0\""));
     assert!(index_text.contains(cksum));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/catalog.json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["schema_version"],
+        Value::String("x07.index-catalog@0.1.0".to_string())
+    );
+    assert_eq!(json["packages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        json["packages"][0]["name"],
+        Value::String("hello".to_string())
+    );
+    assert_eq!(
+        json["packages"][0]["latest"],
+        Value::String("0.1.0".to_string())
+    );
 
     let resp = app
         .clone()
@@ -177,11 +340,18 @@ async fn publish_creates_index_and_download() {
 #[tokio::test]
 async fn publish_requires_token_when_configured() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
     let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
-        data_dir: tmp.path().to_path_buf(),
         public_base: "http://127.0.0.1:8080".to_string(),
-        auth_token: Some("secret".to_string()),
-    });
+        database_url,
+        database_schema,
+        bootstrap_token: Some("bootstrap".to_string()),
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
 
     let tar = make_tar_with_package("hello", "0.1.0");
     let resp = app
@@ -198,15 +368,195 @@ async fn publish_requires_token_when_configured() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/bootstrap")
+                .header("Authorization", "Bearer bootstrap")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"tester"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let token = json["token"].as_str().expect("token str").to_string();
+
+    let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/packages/publish")
-                .header("Authorization", "Bearer secret")
+                .header("Authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::from(tar))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn tokens_owners_and_yank_flow_is_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
+        public_base: "http://127.0.0.1:8080".to_string(),
+        database_url,
+        database_schema,
+        bootstrap_token: Some("bootstrap".to_string()),
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+    })
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/bootstrap")
+                .header("Authorization", "Bearer bootstrap")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"alice"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let alice_token = json["token"].as_str().expect("alice token").to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/bootstrap")
+                .header("Authorization", "Bearer bootstrap")
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"bob","scopes":["publish"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let bob_token = json["token"].as_str().expect("bob token").to_string();
+
+    let tar = make_tar_with_package("hello", "0.1.0");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .body(axum::body::Body::from(tar.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/owners")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"bob"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let tar = make_tar_with_package("hello", "0.2.0");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {bob_token}"))
+                .body(axum::body::Body::from(tar.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=hel")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert!(json["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "hello"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/0.2.0/yank")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"yanked":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/he/ll/hello")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let index_text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+        .expect("index utf-8");
+    assert!(index_text.contains("\"version\":\"0.2.0\""));
+    assert!(index_text.contains("\"yanked\":true"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/catalog.json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["packages"][0]["latest"],
+        Value::String("0.1.0".to_string())
+    );
 }

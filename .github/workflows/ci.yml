@@ -109,14 +109,18 @@ jobs:
       DO_REGISTRY_APP_ID: ${{ secrets.DO_REGISTRY_APP_ID }}
     if: >
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      env.DO_API_TOKEN != '' &&
-      env.DO_REGISTRY_APP_ID != ''
+      github.ref == 'refs/heads/main'
     steps:
+      - name: Skip (missing DO secrets)
+        if: ${{ env.DO_API_TOKEN == '' || env.DO_REGISTRY_APP_ID == '' }}
+        run: echo "DO_API_TOKEN/DO_REGISTRY_APP_ID not set; skipping deployment."
+
       - name: Install doctl
+        if: ${{ env.DO_API_TOKEN != '' && env.DO_REGISTRY_APP_ID != '' }}
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ env.DO_API_TOKEN }}
 
       - name: Trigger deployment
+        if: ${{ env.DO_API_TOKEN != '' && env.DO_REGISTRY_APP_ID != '' }}
         run: doctl apps create-deployment ${{ env.DO_REGISTRY_APP_ID }}

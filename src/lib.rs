@@ -2567,6 +2567,12 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .connect(&cfg.database_url)
         .await
         .expect("connect postgres");
+
+    let create_schema_stmt = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", cfg.database_schema);
+    sqlx::query(&create_schema_stmt)
+        .execute(&db)
+        .await
+        .expect("create postgres schema");
     sqlx::migrate!().run(&db).await.expect("migrate postgres");
 
     let state = Arc::new(AppState {

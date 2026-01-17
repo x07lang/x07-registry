@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
@@ -603,6 +603,44 @@ async fn index_config(State(state): State<Arc<AppState>>) -> Response {
         auth_required: false,
         sparse: true,
     })
+}
+
+fn request_is_index_vhost(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    host.split(':')
+        .next()
+        .unwrap_or(host)
+        .eq_ignore_ascii_case("index.x07.io")
+}
+
+async fn index_config_root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !request_is_index_vhost(&headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    index_config(State(state)).await
+}
+
+async fn index_file_root(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !request_is_index_vhost(&headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let path = uri.path().trim_start_matches('/').to_string();
+    if path.is_empty() {
+        return Redirect::temporary("/catalog.json").into_response();
+    }
+
+    index_file(State(state), AxPath(path)).await
+}
+
+async fn index_prefix_redirect() -> impl IntoResponse {
+    Redirect::temporary("/index/catalog.json")
 }
 
 async fn index_file(State(state): State<Arc<AppState>>, AxPath(path): AxPath<String>) -> Response {
@@ -2583,8 +2621,13 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/index", get(index_prefix_redirect))
+        .route("/index/", get(index_prefix_redirect))
         .route("/index/config.json", get(index_config))
         .route("/index/{*path}", get(index_file))
+        .route("/config.json", get(index_config_root))
+        .route("/catalog.json", get(index_file_root))
+        .route("/{*path}", get(index_file_root))
         .route("/v1/admin/bootstrap", post(admin_bootstrap))
         .route("/v1/auth/token", post(token))
         .route("/v1/account", get(account))

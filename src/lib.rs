@@ -1722,6 +1722,10 @@ struct SearchParams {
 struct SearchHit {
     name: String,
     latest_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modules_count: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1746,6 +1750,8 @@ async fn search(
     struct Row {
         name: String,
         latest_version: Option<String>,
+        description: Option<String>,
+        modules_count: Option<i32>,
     }
 
     let (total, rows): (i64, Vec<Row>) = if q.is_empty() {
@@ -1763,7 +1769,17 @@ async fn search(
             }
         };
         let rows: Vec<Row> = match sqlx::query_as(
-            "SELECT name, latest_version FROM packages ORDER BY name ASC LIMIT $1 OFFSET $2",
+            r#"
+            SELECT
+                p.name,
+                p.latest_version,
+                pv.manifest->>'description' AS description,
+                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
+            FROM packages p
+            LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            ORDER BY p.name ASC
+            LIMIT $1 OFFSET $2
+            "#,
         )
         .bind(limit as i64)
         .bind(offset as i64)
@@ -1798,7 +1814,18 @@ async fn search(
                 }
             };
         let rows: Vec<Row> = match sqlx::query_as(
-            "SELECT name, latest_version FROM packages WHERE name LIKE $1 ORDER BY name ASC LIMIT $2 OFFSET $3",
+            r#"
+            SELECT
+                p.name,
+                p.latest_version,
+                pv.manifest->>'description' AS description,
+                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
+            FROM packages p
+            LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            WHERE p.name LIKE $1
+            ORDER BY p.name ASC
+            LIMIT $2 OFFSET $3
+            "#,
         )
         .bind(&like)
         .bind(limit as i64)
@@ -1829,6 +1856,8 @@ async fn search(
             .map(|r| SearchHit {
                 name: r.name,
                 latest_version: r.latest_version,
+                description: r.description,
+                modules_count: r.modules_count,
             })
             .collect(),
     })

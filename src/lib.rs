@@ -952,7 +952,7 @@ async fn auth_github_start(
 ) -> Response {
     let Some(oauth) = state.cfg.github_oauth.as_ref() else {
         return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
             "X07REG_GITHUB_OAUTH_DISABLED",
             "GitHub OAuth is not configured",
         );
@@ -1088,7 +1088,7 @@ async fn auth_github_callback(
 ) -> Response {
     let Some(oauth) = state.cfg.github_oauth.as_ref() else {
         return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_REQUEST,
             "X07REG_GITHUB_OAUTH_DISABLED",
             "GitHub OAuth is not configured",
         );

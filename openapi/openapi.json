@@ -3,7 +3,9 @@
   "info": { "title": "X07 Registry API", "version": "0.1.0" },
   "components": {
     "securitySchemes": {
-      "bearerAuth": { "type": "http", "scheme": "bearer" }
+      "bearerAuth": { "type": "http", "scheme": "bearer" },
+      "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "x07_session" },
+      "csrfHeader": { "type": "apiKey", "in": "header", "name": "X-X07-CSRF" }
     },
     "schemas": {
       "ErrorResponse": {
@@ -46,6 +48,42 @@
           "handle": { "type": "string" },
           "token_id": { "type": "string", "format": "uuid" },
           "scopes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AuthSessionUser": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "handle",
+          "email_verified",
+          "email_primary",
+          "is_admin",
+          "scopes"
+        ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "handle": { "type": "string" },
+          "github_user_id": { "type": ["integer", "null"] },
+          "github_login": { "type": ["string", "null"] },
+          "avatar_url": { "type": ["string", "null"] },
+          "profile_url": { "type": ["string", "null"] },
+          "email": { "type": ["string", "null"] },
+          "email_verified": { "type": "boolean" },
+          "email_primary": { "type": "boolean" },
+          "is_admin": { "type": "boolean" },
+          "scopes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AuthSessionResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "authenticated"],
+        "properties": {
+          "ok": { "const": true },
+          "authenticated": { "type": "boolean" },
+          "csrf_token": { "type": "string" },
+          "user": { "$ref": "#/components/schemas/AuthSessionUser" }
         }
       },
       "SearchHit": {
@@ -154,29 +192,6 @@
           "name": { "type": "string" },
           "version": { "type": "string" },
           "yanked": { "type": "boolean" }
-        }
-      },
-      "BootstrapRequest": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["handle"],
-        "properties": {
-          "handle": { "type": "string" },
-          "label": { "type": "string" },
-          "scopes": { "type": "array", "items": { "type": "string" } }
-        }
-      },
-      "BootstrapResponse": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["ok", "user_id", "handle", "token_id", "token", "scopes"],
-        "properties": {
-          "ok": { "const": true },
-          "user_id": { "type": "string", "format": "uuid" },
-          "handle": { "type": "string" },
-          "token_id": { "type": "string", "format": "uuid" },
-          "token": { "type": "string" },
-          "scopes": { "type": "array", "items": { "type": "string" } }
         }
       },
       "PackageManifest": {
@@ -316,6 +331,65 @@
         }
       }
     },
+    "/v1/auth/github/start": {
+      "get": {
+        "parameters": [
+          { "name": "next", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "302": { "description": "Redirect to GitHub" }
+        }
+      }
+    },
+    "/v1/auth/github/callback": {
+      "get": {
+        "parameters": [
+          { "name": "code", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "302": { "description": "Set session cookie and redirect" }
+        }
+      }
+    },
+    "/v1/auth/session": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Current web session",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuthSessionResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "security": [{ "sessionCookie": [], "csrfHeader": [] }],
+        "responses": {
+          "204": { "description": "Logged out" },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/account": {
       "get": {
         "security": [{ "bearerAuth": [] }],
@@ -330,45 +404,6 @@
           },
           "401": {
             "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/admin/bootstrap": {
-      "post": {
-        "security": [{ "bearerAuth": [] }],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/BootstrapRequest" }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Bootstrapped user and token",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/BootstrapResponse" }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
-              }
-            }
-          },
-          "403": {
-            "description": "Disabled",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -399,7 +434,7 @@
     },
     "/v1/tokens": {
       "get": {
-        "security": [{ "bearerAuth": [] }],
+        "security": [{ "sessionCookie": [] }, { "bearerAuth": [] }],
         "responses": {
           "200": {
             "description": "List tokens",
@@ -428,7 +463,7 @@
         }
       },
       "post": {
-        "security": [{ "bearerAuth": [] }],
+        "security": [{ "sessionCookie": [], "csrfHeader": [] }, { "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -467,7 +502,7 @@
     },
     "/v1/tokens/{token_id}/revoke": {
       "post": {
-        "security": [{ "bearerAuth": [] }],
+        "security": [{ "sessionCookie": [], "csrfHeader": [] }, { "bearerAuth": [] }],
         "parameters": [
           { "name": "token_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
         ],
@@ -689,7 +724,7 @@
     },
     "/v1/packages/{name}/{version}/yank": {
       "post": {
-        "security": [{ "bearerAuth": [] }],
+        "security": [{ "bearerAuth": [] }, { "sessionCookie": [], "csrfHeader": [] }],
         "parameters": [
           { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
           { "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }

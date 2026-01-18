@@ -1,10 +1,14 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{collections::HashSet, time::Duration};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH};
+use axum::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
+    SET_COOKIE,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -31,6 +35,9 @@ tokio::task_local! {
 
 const CACHE_CONTROL_INDEX: &str = "public, max-age=300";
 const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=60";
+const CSRF_HEADER_NAME: &str = "x-x07-csrf";
+const SESSION_COOKIE_NAME: &str = "x07_session";
+const USER_AGENT: &str = "x07-registry";
 
 fn current_request_id() -> String {
     REQUEST_ID
@@ -101,26 +108,42 @@ pub enum RegistryStorageConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct GithubOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub authorize_base: String,
+    pub api_base: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RegistryConfig {
     pub public_base: String,
+    pub web_base: String,
     pub database_url: String,
     pub database_schema: String,
-    pub bootstrap_token: Option<String>,
     pub cors_origins: Vec<String>,
     pub storage: RegistryStorageConfig,
     pub verified_namespaces: Vec<String>,
+    pub github_oauth: Option<GithubOAuthConfig>,
+    pub admin_github_user_ids: HashSet<i64>,
+    pub session_cookie_domain: Option<String>,
+    pub session_cookie_secure: bool,
+    pub session_ttl_seconds: i64,
+    pub oauth_state_ttl_seconds: i64,
+    pub require_verified_email_for_publish: bool,
 }
 
 impl RegistryConfig {
     pub fn from_env() -> Self {
         let public_base = std::env::var("X07_REGISTRY_PUBLIC_BASE")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        let web_base =
+            std::env::var("X07_REGISTRY_WEB_BASE").unwrap_or_else(|_| "https://x07.io".to_string());
         let database_url = std::env::var("X07_REGISTRY_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://x07:x07@127.0.0.1:5432/x07_registry".to_string());
         let database_schema =
             std::env::var("X07_REGISTRY_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_string());
-        let bootstrap_token = std::env::var("X07_REGISTRY_BOOTSTRAP_TOKEN").ok();
         let cors_origins = std::env::var("X07_REGISTRY_CORS_ORIGINS")
             .ok()
             .map(|s| {
@@ -130,6 +153,56 @@ impl RegistryConfig {
                     .collect()
             })
             .unwrap_or_default();
+
+        let github_client_id = std::env::var("X07_REGISTRY_GITHUB_CLIENT_ID").ok();
+        let github_client_secret = std::env::var("X07_REGISTRY_GITHUB_CLIENT_SECRET").ok();
+        let github_oauth = match (github_client_id, github_client_secret) {
+            (Some(client_id), Some(client_secret)) => Some(GithubOAuthConfig {
+                client_id,
+                client_secret,
+                authorize_base: std::env::var("X07_REGISTRY_GITHUB_AUTHORIZE_BASE")
+                    .unwrap_or_else(|_| "https://github.com".to_string()),
+                api_base: std::env::var("X07_REGISTRY_GITHUB_API_BASE")
+                    .unwrap_or_else(|_| "https://api.github.com".to_string()),
+            }),
+            _ => None,
+        };
+
+        let mut admin_github_user_ids: HashSet<i64> = HashSet::new();
+        if let Ok(raw) = std::env::var("X07_REGISTRY_ADMIN_GITHUB_USER_IDS") {
+            for part in raw.split(',') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let id: i64 = trimmed
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid X07_REGISTRY_ADMIN_GITHUB_USER_IDS entry: {trimmed:?}"));
+                admin_github_user_ids.insert(id);
+            }
+        }
+
+        let session_cookie_domain = std::env::var("X07_REGISTRY_SESSION_COOKIE_DOMAIN")
+            .ok()
+            .and_then(|v| {
+                let trimmed = v.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            });
+        let session_cookie_secure = std::env::var("X07_REGISTRY_SESSION_COOKIE_SECURE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let session_ttl_seconds: i64 = std::env::var("X07_REGISTRY_SESSION_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60 * 60 * 24 * 30);
+        let oauth_state_ttl_seconds: i64 = std::env::var("X07_REGISTRY_OAUTH_STATE_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600);
+        let require_verified_email_for_publish =
+            std::env::var("X07_REGISTRY_REQUIRE_VERIFIED_EMAIL_FOR_PUBLISH")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(true);
 
         let mut verified_namespaces = std::env::var("X07_REGISTRY_VERIFIED_NAMESPACES")
             .ok()
@@ -185,12 +258,19 @@ impl RegistryConfig {
         };
         Self {
             public_base,
+            web_base,
             database_url,
             database_schema,
-            bootstrap_token,
             cors_origins,
             storage,
             verified_namespaces,
+            github_oauth,
+            admin_github_user_ids,
+            session_cookie_domain,
+            session_cookie_secure,
+            session_ttl_seconds,
+            oauth_state_ttl_seconds,
+            require_verified_email_for_publish,
         }
     }
 }
@@ -413,6 +493,7 @@ struct AppState {
     store: Store,
     db: PgPool,
     publish_lock: Mutex<()>,
+    http: reqwest::Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -516,11 +597,17 @@ fn is_valid_db_schema_name(schema: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
+enum AuthKind {
+    Token { token_id: Uuid },
+    Session { session_id: Uuid, csrf_token: String },
+}
+
+#[derive(Debug, Clone)]
 struct AuthContext {
-    token_id: Uuid,
     user_id: Uuid,
     user_handle: String,
     scopes: Vec<String>,
+    kind: AuthKind,
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -529,31 +616,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     raw.strip_prefix("Bearer ")
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
-}
-
-fn require_bootstrap_auth(headers: &HeaderMap, cfg: &RegistryConfig) -> ApiResult<()> {
-    let Some(expected) = cfg.bootstrap_token.as_deref() else {
-        return Err(boxed_json_error(
-            StatusCode::FORBIDDEN,
-            "X07REG_BOOTSTRAP_DISABLED",
-            "bootstrap is not enabled",
-        ));
-    };
-    let Some(token) = bearer_token(headers) else {
-        return Err(boxed_json_error(
-            StatusCode::UNAUTHORIZED,
-            "X07REG_AUTH_REQUIRED",
-            "missing Authorization header",
-        ));
-    };
-    if token != expected {
-        return Err(boxed_json_error(
-            StatusCode::UNAUTHORIZED,
-            "X07REG_AUTH_INVALID",
-            "invalid token",
-        ));
-    }
-    Ok(())
 }
 
 fn require_scope(auth: &AuthContext, scope: &str) -> ApiResult<()> {
@@ -625,17 +687,22 @@ async fn require_token(
     }
 
     let auth = AuthContext {
-        token_id: row.id,
         user_id: row.user_id,
         user_handle: row.handle,
         scopes: row.scopes,
+        kind: AuthKind::Token { token_id: row.id },
     };
     for scope in required_scopes {
         require_scope(&auth, scope)?;
     }
 
+    let token_id = match &auth.kind {
+        AuthKind::Token { token_id } => *token_id,
+        AuthKind::Session { .. } => unreachable!("require_token always returns AuthKind::Token"),
+    };
+
     sqlx::query("UPDATE tokens SET last_used_at = now() WHERE id = $1")
-        .bind(auth.token_id)
+        .bind(token_id)
         .execute(&state.db)
         .await
         .map_err(|err| {
@@ -649,8 +716,964 @@ async fn require_token(
     Ok(auth)
 }
 
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (k, v) = trimmed.split_once('=')?;
+        if k.trim() == name {
+            let value = v.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn session_scopes(is_admin: bool) -> Vec<String> {
+    let mut scopes = vec![
+        "publish".to_string(),
+        "token.manage".to_string(),
+        "owner.manage".to_string(),
+    ];
+    if is_admin {
+        scopes.push("admin".to_string());
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn require_allowed_origin(headers: &HeaderMap, cfg: &RegistryConfig) -> ApiResult<()> {
+    let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Err(boxed_json_error(
+            StatusCode::FORBIDDEN,
+            "X07REG_CSRF_ORIGIN_REQUIRED",
+            "missing Origin header",
+        ));
+    };
+
+    if cfg.cors_origins.iter().any(|o| o == origin) {
+        return Ok(());
+    }
+
+    Err(boxed_json_error(
+        StatusCode::FORBIDDEN,
+        "X07REG_CSRF_ORIGIN_FORBIDDEN",
+        format!("origin not allowed: {origin}"),
+    ))
+}
+
+fn require_csrf(headers: &HeaderMap, auth: &AuthContext, cfg: &RegistryConfig) -> ApiResult<()> {
+    let AuthKind::Session { csrf_token, .. } = &auth.kind else {
+        return Ok(());
+    };
+
+    require_allowed_origin(headers, cfg)?;
+
+    let Some(provided) = headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok()) else {
+        return Err(boxed_json_error(
+            StatusCode::FORBIDDEN,
+            "X07REG_CSRF_REQUIRED",
+            format!("missing {CSRF_HEADER_NAME} header"),
+        ));
+    };
+    if provided != csrf_token {
+        return Err(boxed_json_error(
+            StatusCode::FORBIDDEN,
+            "X07REG_CSRF_INVALID",
+            "invalid CSRF token",
+        ));
+    }
+    Ok(())
+}
+
+async fn require_session(
+    headers: &HeaderMap,
+    state: &AppState,
+    required_scopes: &[&str],
+) -> ApiResult<AuthContext> {
+    let Some(token) = cookie_value(headers, SESSION_COOKIE_NAME) else {
+        return Err(boxed_json_error(
+            StatusCode::UNAUTHORIZED,
+            "X07REG_AUTH_REQUIRED",
+            format!("missing {SESSION_COOKIE_NAME} cookie"),
+        ));
+    };
+    let token_hash = sha256_hex(token.as_bytes());
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        session_id: Uuid,
+        user_id: Uuid,
+        handle: String,
+        csrf_token: String,
+        expires_at: DateTime<Utc>,
+        github_user_id: Option<i64>,
+    }
+
+    let row: Option<Row> = sqlx::query_as(
+        r#"
+        SELECT s.id AS session_id, s.user_id, u.handle, s.csrf_token, s.expires_at, u.github_user_id
+        FROM web_sessions s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.session_token_hash = $1
+        "#,
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| {
+        boxed_json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("db query failed: {err}"),
+        )
+    })?;
+
+    let Some(row) = row else {
+        return Err(boxed_json_error(
+            StatusCode::UNAUTHORIZED,
+            "X07REG_AUTH_INVALID",
+            "invalid session",
+        ));
+    };
+
+    if row.expires_at <= Utc::now() {
+        let _ = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+            .bind(row.session_id)
+            .execute(&state.db)
+            .await;
+        return Err(boxed_json_error(
+            StatusCode::UNAUTHORIZED,
+            "X07REG_AUTH_EXPIRED",
+            "session expired",
+        ));
+    }
+
+    let _ = sqlx::query("UPDATE web_sessions SET last_seen_at = now() WHERE id = $1")
+        .bind(row.session_id)
+        .execute(&state.db)
+        .await;
+
+    let is_admin = row
+        .github_user_id
+        .is_some_and(|id| state.cfg.admin_github_user_ids.contains(&id));
+
+    let auth = AuthContext {
+        user_id: row.user_id,
+        user_handle: row.handle,
+        scopes: session_scopes(is_admin),
+        kind: AuthKind::Session {
+            session_id: row.session_id,
+            csrf_token: row.csrf_token,
+        },
+    };
+
+    for scope in required_scopes {
+        require_scope(&auth, scope)?;
+    }
+
+    Ok(auth)
+}
+
+async fn require_auth(
+    headers: &HeaderMap,
+    state: &AppState,
+    required_scopes: &[&str],
+) -> ApiResult<AuthContext> {
+    if bearer_token(headers).is_some() {
+        require_token(headers, state, required_scopes).await
+    } else {
+        require_session(headers, state, required_scopes).await
+    }
+}
+
+fn actor_token_id(auth: &AuthContext) -> Option<Uuid> {
+    match &auth.kind {
+        AuthKind::Token { token_id } => Some(*token_id),
+        AuthKind::Session { .. } => None,
+    }
+}
+
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubStartParams {
+    next: Option<String>,
+}
+
+fn normalize_next_path(next: Option<&str>) -> ApiResult<String> {
+    let raw = next.unwrap_or("/").trim();
+    if raw.is_empty() {
+        return Ok("/".to_string());
+    }
+    if !raw.starts_with('/') || raw.starts_with("//") || raw.contains("://") {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_AUTH_NEXT_INVALID",
+            "next must be a relative path (starting with /)",
+        ));
+    }
+    if raw.contains('\n') || raw.contains('\r') {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_AUTH_NEXT_INVALID",
+            "next contains invalid characters",
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+async fn auth_github_start(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GithubStartParams>,
+) -> Response {
+    let Some(oauth) = state.cfg.github_oauth.as_ref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "X07REG_GITHUB_OAUTH_DISABLED",
+            "GitHub OAuth is not configured",
+        );
+    };
+
+    let next_path = match normalize_next_path(params.next.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    let expires_at = Utc::now()
+        + chrono::Duration::seconds(state.cfg.oauth_state_ttl_seconds.max(1).min(3600));
+
+    let oauth_state = {
+        let mut rng = rand::rngs::OsRng;
+        let mut raw = [0u8; 32];
+        rng.fill_bytes(&mut raw);
+        let state = format!("x07o_{}", sha256_hex(&raw));
+        state
+    };
+
+    if let Err(err) = sqlx::query("INSERT INTO oauth_states(state, next_url, expires_at) VALUES ($1, $2, $3)")
+        .bind(&oauth_state)
+        .bind(&next_path)
+        .bind(expires_at)
+        .execute(&state.db)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("insert oauth state: {err}"),
+        );
+    }
+
+    let redirect_uri = format!(
+        "{}/v1/auth/github/callback",
+        state.cfg.public_base.trim_end_matches('/')
+    );
+
+    let authorize_url = match reqwest::Url::parse(&format!(
+        "{}/login/oauth/authorize",
+        oauth.authorize_base.trim_end_matches('/')
+    )) {
+        Ok(mut url) => {
+            url.query_pairs_mut()
+                .append_pair("client_id", &oauth.client_id)
+                .append_pair("redirect_uri", &redirect_uri)
+                .append_pair("state", &oauth_state)
+                .append_pair("scope", "read:user user:email")
+                .append_pair("allow_signup", "true");
+            url.to_string()
+        }
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_CONFIG",
+                format!("invalid GitHub authorize_base: {err}"),
+            )
+        }
+    };
+
+    Redirect::temporary(&authorize_url).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubUserResponse {
+    id: i64,
+    login: String,
+    avatar_url: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubEmailResponse {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UserRow {
+    id: Uuid,
+    handle: String,
+    created_via: String,
+}
+
+fn cookie_session_set(cfg: &RegistryConfig, value: &str) -> String {
+    let max_age = cfg.session_ttl_seconds.max(1).min(60 * 60 * 24 * 365);
+    let mut out = format!(
+        "{SESSION_COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+    );
+    if let Some(domain) = cfg.session_cookie_domain.as_deref() {
+        out.push_str(&format!("; Domain={domain}"));
+    }
+    if cfg.session_cookie_secure {
+        out.push_str("; Secure");
+    }
+    out
+}
+
+fn cookie_session_clear(cfg: &RegistryConfig) -> String {
+    let mut out = format!(
+        "{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    );
+    if let Some(domain) = cfg.session_cookie_domain.as_deref() {
+        out.push_str(&format!("; Domain={domain}"));
+    }
+    if cfg.session_cookie_secure {
+        out.push_str("; Secure");
+    }
+    out
+}
+
+async fn auth_github_callback(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GithubCallbackParams>,
+) -> Response {
+    let Some(oauth) = state.cfg.github_oauth.as_ref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "X07REG_GITHUB_OAUTH_DISABLED",
+            "GitHub OAuth is not configured",
+        );
+    };
+
+    if let Some(err) = params.error.as_deref() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_GITHUB_OAUTH_FAILED",
+            params
+                .error_description
+                .clone()
+                .unwrap_or_else(|| format!("oauth error: {err}")),
+        );
+    }
+
+    let Some(code) = params.code.as_deref() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_GITHUB_OAUTH_CODE_MISSING",
+            "missing code",
+        );
+    };
+    let Some(state_param) = params.state.as_deref() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_GITHUB_OAUTH_STATE_MISSING",
+            "missing state",
+        );
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct OauthStateRow {
+        next_url: String,
+        expires_at: DateTime<Utc>,
+    }
+
+    let oauth_state: Option<OauthStateRow> = match sqlx::query_as(
+        "SELECT next_url, expires_at FROM oauth_states WHERE state = $1",
+    )
+    .bind(state_param)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select oauth state: {err}"),
+            )
+        }
+    };
+    let Some(oauth_state) = oauth_state else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_GITHUB_OAUTH_STATE_INVALID",
+            "invalid state",
+        );
+    };
+    if oauth_state.expires_at <= Utc::now() {
+        let _ = sqlx::query("DELETE FROM oauth_states WHERE state = $1")
+            .bind(state_param)
+            .execute(&state.db)
+            .await;
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_GITHUB_OAUTH_STATE_EXPIRED",
+            "state expired",
+        );
+    }
+    if let Err(err) = sqlx::query("DELETE FROM oauth_states WHERE state = $1")
+        .bind(state_param)
+        .execute(&state.db)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("delete oauth state: {err}"),
+        );
+    }
+
+    let redirect_uri = format!(
+        "{}/v1/auth/github/callback",
+        state.cfg.public_base.trim_end_matches('/')
+    );
+
+    let token_url = format!(
+        "{}/login/oauth/access_token",
+        oauth.authorize_base.trim_end_matches('/')
+    );
+    let token_resp = match state
+        .http
+        .post(token_url)
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", oauth.client_id.as_str()),
+            ("client_secret", oauth.client_secret.as_str()),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+        ])
+        .send()
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_TOKEN_REQUEST_FAILED",
+                format!("github token request failed: {err}"),
+            )
+        }
+    };
+
+    let token_json: GithubTokenResponse = match token_resp.json().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_TOKEN_RESPONSE_INVALID",
+                format!("github token response invalid: {err}"),
+            )
+        }
+    };
+    let Some(access_token) = token_json.access_token else {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "X07REG_GITHUB_OAUTH_TOKEN_EXCHANGE_FAILED",
+            token_json
+                .error_description
+                .or(token_json.error)
+                .unwrap_or_else(|| "token exchange failed".to_string()),
+        );
+    };
+
+    let user_url = format!("{}/user", oauth.api_base.trim_end_matches('/'));
+    let user_resp = match state
+        .http
+        .get(user_url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_USER_REQUEST_FAILED",
+                format!("github user request failed: {err}"),
+            )
+        }
+    };
+    if !user_resp.status().is_success() {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "X07REG_GITHUB_OAUTH_USER_REQUEST_FAILED",
+            format!("github user request failed: HTTP {}", user_resp.status()),
+        );
+    }
+
+    let user_json: GithubUserResponse = match user_resp.json().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_USER_RESPONSE_INVALID",
+                format!("github user response invalid: {err}"),
+            )
+        }
+    };
+
+    let emails_url = format!("{}/user/emails", oauth.api_base.trim_end_matches('/'));
+    let emails_resp = match state
+        .http
+        .get(emails_url)
+        .bearer_auth(&access_token)
+        .send()
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_EMAILS_REQUEST_FAILED",
+                format!("github emails request failed: {err}"),
+            )
+        }
+    };
+    if !emails_resp.status().is_success() {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "X07REG_GITHUB_OAUTH_EMAILS_REQUEST_FAILED",
+            format!("github emails request failed: HTTP {}", emails_resp.status()),
+        );
+    }
+    let emails_json: Vec<GithubEmailResponse> = match emails_resp.json().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "X07REG_GITHUB_OAUTH_EMAILS_RESPONSE_INVALID",
+                format!("github emails response invalid: {err}"),
+            )
+        }
+    };
+
+    let login = user_json.login.trim().to_ascii_lowercase();
+    if let Err(resp) = validate_pkg_name(&login) {
+        return *resp;
+    }
+
+    let mut email: Option<String> = None;
+    let mut email_verified = false;
+    let mut email_primary = false;
+    if let Some(primary_verified) = emails_json
+        .iter()
+        .find(|e| e.primary && e.verified)
+        .or_else(|| emails_json.iter().find(|e| e.verified))
+    {
+        email = Some(primary_verified.email.clone());
+        email_verified = primary_verified.verified;
+        email_primary = primary_verified.primary;
+    }
+
+    let mut tx = match state.db.begin().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("begin transaction: {err}"),
+            )
+        }
+    };
+
+    let mut user_row: Option<UserRow> = match sqlx::query_as(
+        "SELECT id, handle, created_via FROM users WHERE github_user_id = $1",
+    )
+    .bind(user_json.id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select user by github id: {err}"),
+            )
+        }
+    };
+
+    if user_row.is_none() {
+        user_row = match sqlx::query_as(
+            "SELECT id, handle, created_via FROM users WHERE handle = $1 AND github_user_id IS NULL",
+        )
+        .bind(&login)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select user by handle: {err}"),
+                )
+            }
+        };
+        if let Some(ref existing) = user_row {
+            let mut can_attach = existing.created_via == "bootstrap";
+            if !can_attach {
+                let has_tokens: bool = match sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM tokens WHERE user_id = $1)",
+                )
+                .bind(existing.id)
+                .fetch_one(&mut *tx)
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "X07REG_DB",
+                            format!("check tokens: {err}"),
+                        )
+                    }
+                };
+                let has_published: bool = match sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM package_versions WHERE published_by = $1)",
+                )
+                .bind(existing.id)
+                .fetch_one(&mut *tx)
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "X07REG_DB",
+                            format!("check publishes: {err}"),
+                        )
+                    }
+                };
+                can_attach = !has_tokens && !has_published;
+            }
+            if !can_attach {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "X07REG_GITHUB_HANDLE_TAKEN",
+                    "a registry account already exists with this handle; contact a registry administrator",
+                );
+            }
+        }
+    }
+
+    let user_id: Uuid = if let Some(existing) = user_row {
+        if let Err(err) = sqlx::query(
+            r#"
+            UPDATE users
+            SET created_via='github',
+                github_user_id=$1,
+                github_login=$2,
+                github_avatar_url=$3,
+                github_profile_url=$4,
+                github_email=$5,
+                github_email_verified=$6,
+                github_email_primary=$7
+            WHERE id=$8
+            "#,
+        )
+        .bind(user_json.id)
+        .bind(&login)
+        .bind(user_json.avatar_url.as_deref())
+        .bind(user_json.html_url.as_deref())
+        .bind(email.as_deref())
+        .bind(email_verified)
+        .bind(email_primary)
+        .bind(existing.id)
+        .execute(&mut *tx)
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("update user: {err}"),
+            );
+        }
+
+        if existing.handle != login {
+            let updated = sqlx::query("UPDATE users SET handle=$1 WHERE id=$2")
+                .bind(&login)
+                .bind(existing.id)
+                .execute(&mut *tx)
+                .await;
+            if let Err(sqlx::Error::Database(db_err)) = updated {
+                if db_err.code().as_deref() != Some("23505") {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB",
+                        format!("update handle: {db_err}"),
+                    );
+                }
+            } else if let Err(err) = updated {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("update handle: {err}"),
+                );
+            }
+        }
+
+        existing.id
+    } else {
+        match sqlx::query_scalar(
+            r#"
+            INSERT INTO users(handle, created_via, github_user_id, github_login, github_avatar_url, github_profile_url, github_email, github_email_verified, github_email_primary)
+            VALUES ($1, 'github', $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+            "#,
+        )
+        .bind(&login)
+        .bind(user_json.id)
+        .bind(&login)
+        .bind(user_json.avatar_url.as_deref())
+        .bind(user_json.html_url.as_deref())
+        .bind(email.as_deref())
+        .bind(email_verified)
+        .bind(email_primary)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(v) => v,
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                return json_error(
+                    StatusCode::CONFLICT,
+                    "X07REG_GITHUB_HANDLE_TAKEN",
+                    "a registry account already exists with this handle; contact a registry administrator",
+                )
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("insert user: {err}"),
+                )
+            }
+        }
+    };
+
+    let (session_token, session_token_hash, csrf_token, expires_at) = {
+        let mut rng = rand::rngs::OsRng;
+        let mut raw = [0u8; 32];
+        rng.fill_bytes(&mut raw);
+        let session_token = format!("x07s_{}", sha256_hex(&raw));
+        let session_token_hash = sha256_hex(session_token.as_bytes());
+        let mut raw = [0u8; 32];
+        rng.fill_bytes(&mut raw);
+        let csrf_token = format!("x07c_{}", sha256_hex(&raw));
+        let expires_at = Utc::now()
+            + chrono::Duration::seconds(state.cfg.session_ttl_seconds.max(60).min(60 * 60 * 24 * 365));
+        (session_token, session_token_hash, csrf_token, expires_at)
+    };
+
+    let _session_id: Uuid = match sqlx::query_scalar(
+        "INSERT INTO web_sessions(user_id, session_token_hash, csrf_token, expires_at) VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(&session_token_hash)
+    .bind(&csrf_token)
+    .bind(expires_at)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("insert session: {err}"),
+            )
+        }
+    };
+
+    if let Err(err) = tx.commit().await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("commit: {err}"),
+        );
+    }
+
+    let next_url = match normalize_next_path(Some(&oauth_state.next_url)) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let redirect_to = format!("{}{}", state.cfg.web_base.trim_end_matches('/'), next_url);
+
+    let mut resp = Redirect::temporary(&redirect_to).into_response();
+    let set_cookie = cookie_session_set(&state.cfg, &session_token);
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&set_cookie).expect("set-cookie header value"),
+    );
+    resp
+}
+
+#[derive(Debug, Serialize)]
+struct AuthSessionUser {
+    id: Uuid,
+    handle: String,
+    github_user_id: Option<i64>,
+    github_login: Option<String>,
+    avatar_url: Option<String>,
+    profile_url: Option<String>,
+    email: Option<String>,
+    email_verified: bool,
+    email_primary: bool,
+    is_admin: bool,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthSessionResponse {
+    ok: bool,
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    csrf_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<AuthSessionUser>,
+}
+
+async fn auth_session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let auth = match require_session(&headers, state.as_ref(), &[]).await {
+        Ok(v) => v,
+        Err(resp) => {
+            if resp.status() == StatusCode::UNAUTHORIZED {
+                return ok_json(AuthSessionResponse {
+                    ok: true,
+                    authenticated: false,
+                    csrf_token: None,
+                    user: None,
+                });
+            }
+            return *resp;
+        }
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        github_user_id: Option<i64>,
+        github_login: Option<String>,
+        github_avatar_url: Option<String>,
+        github_profile_url: Option<String>,
+        github_email: Option<String>,
+        github_email_verified: bool,
+        github_email_primary: bool,
+    }
+
+    let row: Row = match sqlx::query_as(
+        r#"
+        SELECT github_user_id, github_login, github_avatar_url, github_profile_url, github_email, github_email_verified, github_email_primary
+        FROM users
+        WHERE id = $1
+        "#,
+    )
+    .bind(auth.user_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select user: {err}"),
+            )
+        }
+    };
+
+    let is_admin = auth.scopes.iter().any(|s| s == "admin");
+    let csrf_token = match &auth.kind {
+        AuthKind::Session { csrf_token, .. } => csrf_token.clone(),
+        AuthKind::Token { .. } => unreachable!("require_session always returns AuthKind::Session"),
+    };
+
+    ok_json(AuthSessionResponse {
+        ok: true,
+        authenticated: true,
+        csrf_token: Some(csrf_token),
+        user: Some(AuthSessionUser {
+            id: auth.user_id,
+            handle: auth.user_handle,
+            github_user_id: row.github_user_id,
+            github_login: row.github_login,
+            avatar_url: row.github_avatar_url,
+            profile_url: row.github_profile_url,
+            email: row.github_email,
+            email_verified: row.github_email_verified,
+            email_primary: row.github_email_primary,
+            is_admin,
+            scopes: auth.scopes,
+        }),
+    })
+}
+
+async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let auth = match require_session(&headers, state.as_ref(), &[]).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
+    let session_id = match auth.kind {
+        AuthKind::Session { session_id, .. } => session_id,
+        AuthKind::Token { .. } => unreachable!("require_session always returns AuthKind::Session"),
+    };
+
+    if let Err(err) = sqlx::query("DELETE FROM web_sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(&state.db)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("delete session: {err}"),
+        );
+    }
+
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let set_cookie = cookie_session_clear(&state.cfg);
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&set_cookie).expect("set-cookie header value"),
+    );
+    resp
 }
 
 #[derive(Debug, Serialize)]
@@ -905,174 +1928,16 @@ async fn account(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    let token_id = match &auth.kind {
+        AuthKind::Token { token_id } => *token_id,
+        AuthKind::Session { .. } => unreachable!("require_token always returns AuthKind::Token"),
+    };
     ok_json(AccountResponse {
         ok: true,
         user_id: auth.user_id,
         handle: auth.user_handle,
-        token_id: auth.token_id,
-        scopes: auth.scopes,
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct BootstrapRequest {
-    handle: String,
-    #[serde(default)]
-    label: String,
-    #[serde(default)]
-    scopes: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BootstrapResponse {
-    ok: bool,
-    user_id: Uuid,
-    handle: String,
-    token_id: Uuid,
-    token: String,
-    scopes: Vec<String>,
-}
-
-async fn admin_bootstrap(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<BootstrapRequest>,
-) -> Response {
-    if let Err(resp) = require_bootstrap_auth(&headers, &state.cfg) {
-        return *resp;
-    }
-
-    let handle = req.handle.trim().to_ascii_lowercase();
-    if let Err(resp) = validate_pkg_name(&handle) {
-        return *resp;
-    }
-    let label = req.label.trim().to_string();
-
-    let mut scopes = req.scopes;
-    if scopes.is_empty() {
-        scopes = vec![
-            "admin".to_string(),
-            "publish".to_string(),
-            "token.manage".to_string(),
-            "owner.manage".to_string(),
-        ];
-    }
-    for scope in &scopes {
-        match scope.as_str() {
-            "admin" | "publish" | "token.manage" | "owner.manage" => {}
-            _ => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "X07REG_SCOPE_INVALID",
-                    format!("unsupported scope: {scope:?}"),
-                )
-            }
-        }
-    }
-    scopes.sort();
-    scopes.dedup();
-
-    let mut tx = match state.db.begin().await {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("begin transaction: {err}"),
-            )
-        }
-    };
-
-    let user_id: Uuid = match sqlx::query_scalar(
-        "INSERT INTO users(handle) VALUES ($1) ON CONFLICT(handle) DO UPDATE SET handle = EXCLUDED.handle RETURNING id",
-    )
-    .bind(&handle)
-    .fetch_one(&mut *tx)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("upsert user: {err}"),
-            )
-        }
-    };
-
-    let (token_id, token) = {
-        let mut rng = rand::rngs::OsRng;
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            if attempt > 10 {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_TOKEN_GENERATION_FAILED",
-                    "failed to allocate a unique token",
-                );
-            }
-            let mut raw = [0u8; 32];
-            rng.fill_bytes(&mut raw);
-            let token = format!("x07t_{}", sha256_hex(&raw));
-            let token_hash = sha256_hex(token.as_bytes());
-
-            let inserted: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
-                "INSERT INTO tokens(user_id, token_hash, label, scopes) VALUES ($1, $2, $3, $4) RETURNING id",
-            )
-            .bind(user_id)
-            .bind(&token_hash)
-            .bind(&label)
-            .bind(&scopes)
-            .fetch_one(&mut *tx)
-            .await;
-            match inserted {
-                Ok(id) => break (id, token),
-                Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
-                    continue
-                }
-                Err(err) => {
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "X07REG_DB",
-                        format!("insert token: {err}"),
-                    )
-                }
-            }
-        }
-    };
-
-    if let Err(err) = sqlx::query(
-        "INSERT INTO audit_events(actor_user_id, actor_token_id, action, details) VALUES ($1, $2, 'token_created', $3)",
-    )
-    .bind(user_id)
-    .bind(token_id)
-    .bind(serde_json::json!({ "label": &label, "scopes": &scopes }))
-    .execute(&mut *tx)
-    .await
-    {
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "X07REG_DB",
-            format!("insert audit: {err}"),
-        );
-    }
-
-    if let Err(err) = tx.commit().await {
-        return json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "X07REG_DB",
-            format!("commit: {err}"),
-        );
-    }
-
-    ok_json(BootstrapResponse {
-        ok: true,
-        user_id,
-        handle,
         token_id,
-        token,
-        scopes,
+        scopes: auth.scopes,
     })
 }
 
@@ -1093,7 +1958,7 @@ struct TokenListResponse {
 }
 
 async fn tokens_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let auth = match require_token(&headers, state.as_ref(), &["token.manage"]).await {
+    let auth = match require_auth(&headers, state.as_ref(), &["token.manage"]).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -1162,10 +2027,13 @@ async fn token_create(
     headers: HeaderMap,
     Json(req): Json<TokenCreateRequest>,
 ) -> Response {
-    let auth = match require_token(&headers, state.as_ref(), &["token.manage"]).await {
+    let auth = match require_auth(&headers, state.as_ref(), &["token.manage"]).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
 
     let label = req.label.trim().to_string();
     let mut scopes = req.scopes;
@@ -1257,7 +2125,7 @@ async fn token_create(
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, details) VALUES ($1, $2, 'token_created', $3)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(serde_json::json!({ "label": &label, "scopes": &scopes }))
     .execute(&mut *tx)
     .await
@@ -1295,10 +2163,13 @@ async fn token_revoke(
     headers: HeaderMap,
     AxPath(token_id): AxPath<Uuid>,
 ) -> Response {
-    let auth = match require_token(&headers, state.as_ref(), &["token.manage"]).await {
+    let auth = match require_auth(&headers, state.as_ref(), &["token.manage"]).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
     let is_admin = auth.scopes.iter().any(|s| s == "admin");
 
     let mut tx = match state.db.begin().await {
@@ -1339,7 +2210,7 @@ async fn token_revoke(
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, details) VALUES ($1, $2, 'token_revoked', $3)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(serde_json::json!({ "token_id": token_id }))
     .execute(&mut *tx)
     .await
@@ -1400,6 +2271,31 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         Ok(auth) => auth,
         Err(resp) => return *resp,
     };
+
+    if state.cfg.require_verified_email_for_publish && !auth.scopes.iter().any(|s| s == "admin") {
+        let email_verified: bool =
+            match sqlx::query_scalar::<_, bool>("SELECT github_email_verified FROM users WHERE id = $1")
+                .bind(auth.user_id)
+                .fetch_one(&state.db)
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB",
+                        format!("select email status: {err}"),
+                    )
+                }
+            };
+        if !email_verified {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "X07REG_EMAIL_UNVERIFIED",
+                "publishing requires a verified email (sign in at https://x07.io and verify your email on GitHub)",
+            );
+        }
+    }
 
     let bytes: Bytes = match to_bytes(body, 64 * 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -1668,7 +2564,7 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version) VALUES ($1, $2, 'publish', $3, $4)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(pkg_name)
     .bind(pkg_version)
     .execute(&mut *tx)
@@ -2052,10 +2948,13 @@ async fn package_owner_add(
     AxPath(name): AxPath<String>,
     Json(req): Json<OwnerChangeRequest>,
 ) -> Response {
-    let auth = match require_token(&headers, state.as_ref(), &["owner.manage"]).await {
+    let auth = match require_auth(&headers, state.as_ref(), &["owner.manage"]).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
     if let Err(resp) = validate_pkg_name(&name) {
         return *resp;
     }
@@ -2171,7 +3070,7 @@ async fn package_owner_add(
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, details) VALUES ($1, $2, 'owner_added', $3, $4)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(&name)
     .bind(serde_json::json!({ "handle": &handle }))
     .execute(&mut *tx)
@@ -2361,7 +3260,7 @@ async fn package_owner_remove(
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, details) VALUES ($1, $2, 'owner_removed', $3, $4)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(&name)
     .bind(serde_json::json!({ "handle": &handle }))
     .execute(&mut *tx)
@@ -2518,7 +3417,7 @@ async fn package_yank(
         "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(auth.user_id)
-    .bind(auth.token_id)
+    .bind(actor_token_id(&auth))
     .bind(action)
     .bind(&name)
     .bind(&version)
@@ -2767,11 +3666,18 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .expect("create postgres schema");
     sqlx::migrate!().run(&db).await.expect("migrate postgres");
 
+    let http = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build http client");
+
     let state = Arc::new(AppState {
         cfg,
         store,
         db,
         publish_lock: Mutex::new(()),
+        http,
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -2782,8 +3688,11 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .route("/config.json", get(index_config_root))
         .route("/catalog.json", get(index_file_root))
         .route("/{*path}", get(index_file_root))
-        .route("/v1/admin/bootstrap", post(admin_bootstrap))
         .route("/v1/auth/token", post(token))
+        .route("/v1/auth/github/start", get(auth_github_start))
+        .route("/v1/auth/github/callback", get(auth_github_callback))
+        .route("/v1/auth/session", get(auth_session))
+        .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/account", get(account))
         .route("/v1/search", get(search))
         .route("/v1/tokens", get(tokens_list).post(token_create))
@@ -2827,7 +3736,11 @@ fn cors_layer(cfg: &RegistryConfig) -> Option<CorsLayer> {
                     Method::POST,
                     Method::DELETE,
                 ])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
+                .allow_headers([
+                    AUTHORIZATION,
+                    CONTENT_TYPE,
+                    axum::http::header::HeaderName::from_static(CSRF_HEADER_NAME),
+                ]),
         );
     }
 
@@ -2844,6 +3757,7 @@ fn cors_layer(cfg: &RegistryConfig) -> Option<CorsLayer> {
     Some(
         CorsLayer::new()
             .allow_origin(origins)
+            .allow_credentials(true)
             .allow_methods([
                 Method::GET,
                 Method::HEAD,
@@ -2851,7 +3765,11 @@ fn cors_layer(cfg: &RegistryConfig) -> Option<CorsLayer> {
                 Method::POST,
                 Method::DELETE,
             ])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
+            .allow_headers([
+                AUTHORIZATION,
+                CONTENT_TYPE,
+                axum::http::header::HeaderName::from_static(CSRF_HEADER_NAME),
+            ]),
     )
 }
 

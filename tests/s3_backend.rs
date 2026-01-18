@@ -1,10 +1,26 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use rand::RngCore;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::collections::HashSet;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
 
 async fn read_body_json(body: axum::body::Body) -> Value {
     let bytes = body.collect().await.expect("collect body").to_bytes();
@@ -29,6 +45,101 @@ async fn create_test_schema() -> (String, String) {
         .expect("create schema");
 
     (database_url, schema)
+}
+
+async fn connect_test_db(database_url: &str, schema: &str) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .after_connect({
+            let schema = schema.to_string();
+            move |conn, _meta| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    let stmt = format!("SET search_path TO \"{schema}\", public");
+                    sqlx::query(&stmt).execute(conn).await?;
+                    Ok(())
+                })
+            }
+        })
+        .connect(database_url)
+        .await
+        .expect("connect test db")
+}
+
+async fn create_user_with_token(database_url: &str, schema: &str, handle: &str) -> String {
+    let pool = connect_test_db(database_url, schema).await;
+
+    let handle = handle.trim().to_ascii_lowercase();
+
+    let github_user_id: i64 = {
+        let mut raw = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        i64::from_le_bytes(raw).abs().max(1)
+    };
+
+    let user_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO users(handle, created_via, github_user_id, github_login, github_email, github_email_verified, github_email_primary)
+        VALUES ($1, 'github', $2, $3, $4, true, true)
+        ON CONFLICT(handle) DO UPDATE
+            SET created_via='github',
+                github_user_id=EXCLUDED.github_user_id,
+                github_login=EXCLUDED.github_login,
+                github_email=EXCLUDED.github_email,
+                github_email_verified=true,
+                github_email_primary=true
+        RETURNING id
+        "#,
+    )
+    .bind(&handle)
+    .bind(github_user_id)
+    .bind(&handle)
+    .bind(format!("{handle}@example.com"))
+    .fetch_one(&pool)
+    .await
+    .expect("insert user");
+
+    let token = {
+        let mut raw = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        format!("x07t_{}", sha256_hex(&raw))
+    };
+    let token_hash = sha256_hex(token.as_bytes());
+    let scopes = vec!["publish".to_string()];
+
+    sqlx::query("INSERT INTO tokens(user_id, token_hash, label, scopes) VALUES ($1, $2, '', $3)")
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(scopes)
+        .execute(&pool)
+        .await
+        .expect("insert token");
+
+    token
+}
+
+fn base_config(
+    database_url: String,
+    database_schema: String,
+    storage: x07_registry::RegistryStorageConfig,
+) -> x07_registry::RegistryConfig {
+    x07_registry::RegistryConfig {
+        public_base: "http://127.0.0.1:8080".to_string(),
+        web_base: "http://127.0.0.1:3000".to_string(),
+        database_url,
+        database_schema,
+        cors_origins: Vec::new(),
+        storage,
+        verified_namespaces: Vec::new(),
+        github_oauth: None,
+        admin_github_user_ids: HashSet::new(),
+        session_cookie_domain: None,
+        session_cookie_secure: false,
+        session_ttl_seconds: 60 * 60,
+        oauth_state_ttl_seconds: 600,
+        require_verified_email_for_publish: true,
+    }
 }
 
 fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
@@ -164,33 +275,14 @@ async fn s3_backend_publish_creates_index_and_download() {
     ensure_bucket(&s3_cfg).await;
 
     let (database_url, database_schema) = create_test_schema().await;
-    let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
-        public_base: "http://127.0.0.1:8080".to_string(),
-        database_url,
-        database_schema,
-        bootstrap_token: Some("bootstrap".to_string()),
-        cors_origins: Vec::new(),
-        storage: x07_registry::RegistryStorageConfig::S3(s3_cfg),
-        verified_namespaces: Vec::new(),
-    })
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::S3(s3_cfg),
+    ))
     .await;
 
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/admin/bootstrap")
-                .header("Authorization", "Bearer bootstrap")
-                .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(r#"{"handle":"tester"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = read_body_json(resp.into_body()).await;
-    let token = json["token"].as_str().expect("token str").to_string();
+    let token = create_user_with_token(&database_url, &database_schema, "tester").await;
 
     let tar = make_tar_with_package("hello", "0.1.0");
     let resp = app

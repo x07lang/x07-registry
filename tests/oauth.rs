@@ -177,7 +177,7 @@ async fn github_oauth_onboarding_can_create_token_and_publish() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::FOUND);
     let location = resp
         .headers()
         .get(LOCATION)
@@ -204,7 +204,7 @@ async fn github_oauth_onboarding_can_create_token_and_publish() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(
         resp.headers().get(LOCATION).unwrap(),
         "http://localhost:3000/settings/tokens"

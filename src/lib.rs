@@ -7,7 +7,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
-    SET_COOKIE,
+    LOCATION, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
@@ -523,6 +523,20 @@ fn boxed_json_error(
     Box::new(json_error(status, code, message))
 }
 
+fn redirect(status: StatusCode, location: &str) -> Response {
+    let Ok(location) = HeaderValue::from_str(location) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_CONFIG",
+            "redirect URL contains invalid characters",
+        );
+    };
+
+    let mut resp = status.into_response();
+    resp.headers_mut().insert(LOCATION, location);
+    resp
+}
+
 fn ok_json<T: Serialize>(value: T) -> Response {
     (StatusCode::OK, Json(value)).into_response()
 }
@@ -1001,7 +1015,7 @@ async fn auth_github_start(
         }
     };
 
-    Redirect::temporary(&authorize_url).into_response()
+    redirect(StatusCode::FOUND, &authorize_url)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1534,12 +1548,17 @@ async fn auth_github_callback(
     };
     let redirect_to = format!("{}{}", state.cfg.web_base.trim_end_matches('/'), next_url);
 
-    let mut resp = Redirect::temporary(&redirect_to).into_response();
     let set_cookie = cookie_session_set(&state.cfg, &session_token);
-    resp.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&set_cookie).expect("set-cookie header value"),
-    );
+    let Ok(set_cookie) = HeaderValue::from_str(&set_cookie) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_CONFIG",
+            "session cookie contains invalid characters",
+        );
+    };
+
+    let mut resp = redirect(StatusCode::FOUND, &redirect_to);
+    resp.headers_mut().insert(SET_COOKIE, set_cookie);
     resp
 }
 
@@ -1669,10 +1688,14 @@ async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 
     let mut resp = StatusCode::NO_CONTENT.into_response();
     let set_cookie = cookie_session_clear(&state.cfg);
-    resp.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&set_cookie).expect("set-cookie header value"),
-    );
+    let Ok(set_cookie) = HeaderValue::from_str(&set_cookie) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_CONFIG",
+            "session cookie contains invalid characters",
+        );
+    };
+    resp.headers_mut().insert(SET_COOKIE, set_cookie);
     resp
 }
 

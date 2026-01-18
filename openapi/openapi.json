@@ -9,10 +9,11 @@
       "ErrorResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["code", "message"],
+        "required": ["code", "message", "request_id"],
         "properties": {
           "code": { "type": "string" },
-          "message": { "type": "string" }
+          "message": { "type": "string" },
+          "request_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
         }
       },
       "IndexConfig": {
@@ -23,7 +24,8 @@
           "dl": { "type": "string", "format": "uri" },
           "api": { "type": "string", "format": "uri" },
           "auth-required": { "type": "boolean" },
-          "sparse": { "const": true }
+          "sparse": { "const": true },
+          "verified-namespaces": { "type": "array", "items": { "type": "string" } }
         }
       },
       "TokenCheckResponse": {
@@ -184,6 +186,7 @@
         "properties": {
           "schema_version": { "type": "string" },
           "name": { "type": "string" },
+          "description": { "type": "string" },
           "version": { "type": "string" },
           "module_root": { "type": "string" },
           "modules": { "type": "array", "items": { "type": "string" } }

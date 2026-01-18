@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
@@ -23,6 +24,64 @@ use uuid::Uuid;
 
 type ApiError = Box<Response>;
 type ApiResult<T> = Result<T, ApiError>;
+
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
+
+const CACHE_CONTROL_INDEX: &str = "public, max-age=300";
+const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=60";
+
+fn current_request_id() -> String {
+    REQUEST_ID
+        .try_with(|v| v.clone())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let raw = raw.trim();
+    if raw == "*" {
+        return true;
+    }
+    raw.split(',').any(|v| v.trim() == etag)
+}
+
+fn response_not_modified(etag: &str, cache_control: &'static str) -> Response {
+    let mut resp = StatusCode::NOT_MODIFIED.into_response();
+    resp.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(etag).expect("etag header value"),
+    );
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    resp
+}
+
+fn set_cache_headers(resp: &mut Response, etag: &str, cache_control: &'static str) {
+    resp.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(etag).expect("etag header value"),
+    );
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+}
+
+async fn request_id_middleware(req: Request<Body>, next: Next) -> Response {
+    let request_id = Uuid::new_v4().simple().to_string();
+    REQUEST_ID
+        .scope(request_id.clone(), async move {
+            let mut resp = next.run(req).await;
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                HeaderValue::from_str(&request_id).expect("x-request-id header value"),
+            );
+            resp
+        })
+        .await
+}
 
 #[derive(Debug, Clone)]
 pub struct RegistryS3Config {
@@ -49,6 +108,7 @@ pub struct RegistryConfig {
     pub bootstrap_token: Option<String>,
     pub cors_origins: Vec<String>,
     pub storage: RegistryStorageConfig,
+    pub verified_namespaces: Vec<String>,
 }
 
 impl RegistryConfig {
@@ -58,8 +118,8 @@ impl RegistryConfig {
         let database_url = std::env::var("X07_REGISTRY_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| "postgres://x07:x07@127.0.0.1:5432/x07_registry".to_string());
-        let database_schema = std::env::var("X07_REGISTRY_DATABASE_SCHEMA")
-            .unwrap_or_else(|_| "public".to_string());
+        let database_schema =
+            std::env::var("X07_REGISTRY_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_string());
         let bootstrap_token = std::env::var("X07_REGISTRY_BOOTSTRAP_TOKEN").ok();
         let cors_origins = std::env::var("X07_REGISTRY_CORS_ORIGINS")
             .ok()
@@ -70,6 +130,18 @@ impl RegistryConfig {
                     .collect()
             })
             .unwrap_or_default();
+
+        let mut verified_namespaces = std::env::var("X07_REGISTRY_VERIFIED_NAMESPACES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        verified_namespaces.sort();
+        verified_namespaces.dedup();
 
         let storage = match std::env::var("X07_REGISTRY_STORAGE")
             .unwrap_or_else(|_| "fs".to_string())
@@ -118,6 +190,7 @@ impl RegistryConfig {
             bootstrap_token,
             cors_origins,
             storage,
+            verified_namespaces,
         }
     }
 }
@@ -315,10 +388,7 @@ impl Store {
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => Ok(()),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(err) => Err(StoreError::new(format!(
-                        "remove {}: {err}",
-                        path.display()
-                    ))),
+                    Err(err) => Err(StoreError::new(format!("remove {}: {err}", path.display()))),
                 }
             }
             Store::S3(s3) => {
@@ -330,10 +400,7 @@ impl Store {
                     .send()
                     .await
                     .map_err(|err| {
-                        StoreError::new(format!(
-                            "delete s3://{}/{object_key}: {err}",
-                            s3.bucket
-                        ))
+                        StoreError::new(format!("delete s3://{}/{object_key}: {err}", s3.bucket))
                     })?;
                 Ok(())
             }
@@ -352,6 +419,7 @@ struct AppState {
 struct ErrorResponse {
     code: &'static str,
     message: String,
+    request_id: String,
 }
 
 fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
@@ -360,6 +428,7 @@ fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>
         Json(ErrorResponse {
             code,
             message: message.into(),
+            request_id: current_request_id(),
         }),
     )
         .into_response()
@@ -454,7 +523,7 @@ struct AuthContext {
     scopes: Vec<String>,
 }
 
-fn bearer_token<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let h = headers.get(axum::http::header::AUTHORIZATION)?;
     let raw = h.to_str().ok()?;
     raw.strip_prefix("Bearer ")
@@ -591,10 +660,12 @@ struct IndexConfig {
     #[serde(rename = "auth-required")]
     auth_required: bool,
     sparse: bool,
+    #[serde(rename = "verified-namespaces", skip_serializing_if = "Vec::is_empty")]
+    verified_namespaces: Vec<String>,
 }
 
-async fn index_config(State(state): State<Arc<AppState>>) -> Response {
-    ok_json(IndexConfig {
+async fn index_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let cfg = IndexConfig {
         dl: format!(
             "{}/v1/packages/",
             state.cfg.public_base.trim_end_matches('/')
@@ -602,7 +673,18 @@ async fn index_config(State(state): State<Arc<AppState>>) -> Response {
         api: format!("{}/v1/", state.cfg.public_base.trim_end_matches('/')),
         auth_required: false,
         sparse: true,
-    })
+        verified_namespaces: state.cfg.verified_namespaces.clone(),
+    };
+
+    let cfg_bytes = serde_json::to_vec(&cfg).expect("serialize index config");
+    let etag = format!("\"{}\"", sha256_hex(&cfg_bytes));
+    if if_none_match(&headers, &etag) {
+        return response_not_modified(&etag, CACHE_CONTROL_INDEX);
+    }
+
+    let mut resp = ok_json(cfg);
+    set_cache_headers(&mut resp, &etag, CACHE_CONTROL_INDEX);
+    resp
 }
 
 fn request_is_index_vhost(headers: &HeaderMap) -> bool {
@@ -619,7 +701,7 @@ async fn index_config_root(State(state): State<Arc<AppState>>, headers: HeaderMa
     if !request_is_index_vhost(&headers) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    index_config(State(state)).await
+    index_config(State(state), headers).await
 }
 
 async fn index_file_root(
@@ -636,14 +718,22 @@ async fn index_file_root(
         return Redirect::temporary("/catalog.json").into_response();
     }
 
-    index_file(State(state), AxPath(path)).await
+    index_file(State(state), headers, AxPath(path)).await
 }
 
-async fn index_prefix_redirect() -> impl IntoResponse {
+async fn index_root_redirect() -> impl IntoResponse {
     Redirect::temporary("/index/catalog.json")
 }
 
-async fn index_file(State(state): State<Arc<AppState>>, AxPath(path): AxPath<String>) -> Response {
+async fn index_no_slash_redirect() -> impl IntoResponse {
+    Redirect::permanent("/index/")
+}
+
+async fn index_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxPath(path): AxPath<String>,
+) -> Response {
     if path.is_empty() || path.contains("..") || path.contains('\\') {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -659,21 +749,20 @@ async fn index_file(State(state): State<Arc<AppState>>, AxPath(path): AxPath<Str
             latest_version: Option<String>,
         }
 
-        let rows: Vec<CatalogRow> = match sqlx::query_as(
-            "SELECT name, latest_version FROM packages ORDER BY name ASC",
-        )
-        .fetch_all(&state.db)
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("select catalog: {err}"),
-                )
-            }
-        };
+        let rows: Vec<CatalogRow> =
+            match sqlx::query_as("SELECT name, latest_version FROM packages ORDER BY name ASC")
+                .fetch_all(&state.db)
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB",
+                        format!("select catalog: {err}"),
+                    )
+                }
+            };
         let catalog = IndexCatalog {
             schema_version: "x07.index-catalog@0.1.0".to_string(),
             packages: rows
@@ -686,10 +775,19 @@ async fn index_file(State(state): State<Arc<AppState>>, AxPath(path): AxPath<Str
         };
         let mut body = serde_json::to_string(&catalog).expect("serialize catalog");
         body.push('\n');
-        return (StatusCode::OK, body).into_response();
+        let etag = format!("\"{}\"", sha256_hex(body.as_bytes()));
+        if if_none_match(&headers, &etag) {
+            return response_not_modified(&etag, CACHE_CONTROL_INDEX);
+        }
+
+        let mut resp = (StatusCode::OK, body).into_response();
+        resp.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        set_cache_headers(&mut resp, &etag, CACHE_CONTROL_INDEX);
+        return resp;
     }
 
-    let Some(name) = path.split('/').last().filter(|v| !v.is_empty()) else {
+    let Some(name) = path.split('/').next_back().filter(|v| !v.is_empty()) else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "X07REG_INDEX_PATH_INVALID",
@@ -766,7 +864,19 @@ async fn index_file(State(state): State<Arc<AppState>>, AxPath(path): AxPath<Str
         out.push_str(&serde_json::to_string(&line).expect("serialize index entry"));
         out.push('\n');
     }
-    (StatusCode::OK, out).into_response()
+
+    let etag = format!("\"{}\"", sha256_hex(out.as_bytes()));
+    if if_none_match(&headers, &etag) {
+        return response_not_modified(&etag, CACHE_CONTROL_INDEX);
+    }
+
+    let mut resp = (StatusCode::OK, out).into_response();
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    set_cache_headers(&mut resp, &etag, CACHE_CONTROL_INDEX);
+    resp
 }
 
 #[derive(Debug, Serialize)]
@@ -918,9 +1028,7 @@ async fn admin_bootstrap(
             .await;
             match inserted {
                 Ok(id) => break (id, token),
-                Err(sqlx::Error::Database(db_err))
-                    if db_err.code().as_deref() == Some("23505") =>
-                {
+                Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                     continue
                 }
                 Err(err) => {
@@ -1131,9 +1239,7 @@ async fn token_create(
             .await;
             match inserted {
                 Ok(id) => break (id, token),
-                Err(sqlx::Error::Database(db_err))
-                    if db_err.code().as_deref() == Some("23505") =>
-                {
+                Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                     continue
                 }
                 Err(err) => {
@@ -1260,6 +1366,8 @@ async fn token_revoke(
 struct PackageManifest {
     schema_version: String,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     version: String,
     module_root: String,
     modules: Vec<String>,
@@ -1366,22 +1474,21 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         latest_version: Option<String>,
     }
 
-    let existing: Option<PackageRow> = match sqlx::query_as(
-        "SELECT id, latest_version FROM packages WHERE name = $1",
-    )
-    .bind(pkg_name)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select package: {err}"),
-            )
-        }
-    };
+    let existing: Option<PackageRow> =
+        match sqlx::query_as("SELECT id, latest_version FROM packages WHERE name = $1")
+            .bind(pkg_name)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select package: {err}"),
+                )
+            }
+        };
 
     let is_admin = auth.scopes.iter().any(|s| s == "admin");
 
@@ -1431,13 +1538,12 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
                 )
             }
         };
-        if let Err(err) = sqlx::query(
-            "INSERT INTO package_owners(package_id, user_id) VALUES ($1, $2)",
-        )
-        .bind(row.id)
-        .bind(auth.user_id)
-        .execute(&mut *tx)
-        .await
+        if let Err(err) =
+            sqlx::query("INSERT INTO package_owners(package_id, user_id) VALUES ($1, $2)")
+                .bind(row.id)
+                .bind(auth.user_id)
+                .execute(&mut *tx)
+                .await
         {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1628,7 +1734,10 @@ struct SearchResponse {
     packages: Vec<SearchHit>,
 }
 
-async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchParams>) -> Response {
+async fn search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Response {
     let q = params.q.trim().to_string();
     let limit = params.limit.unwrap_or(20).min(100);
     let offset = params.offset.unwrap_or(0);
@@ -1673,20 +1782,21 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<SearchP
         (total, rows)
     } else {
         let like = format!("%{q}%");
-        let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE name LIKE $1")
-            .bind(&like)
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("count search: {err}"),
-                )
-            }
-        };
+        let total: i64 =
+            match sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE name LIKE $1")
+                .bind(&like)
+                .fetch_one(&state.db)
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB",
+                        format!("count search: {err}"),
+                    )
+                }
+            };
         let rows: Vec<Row> = match sqlx::query_as(
             "SELECT name, latest_version FROM packages WHERE name LIKE $1 ORDER BY name ASC LIMIT $2 OFFSET $3",
         )
@@ -1741,7 +1851,10 @@ struct PackageDetailResponse {
     versions: Vec<PackageVersionInfo>,
 }
 
-async fn package_detail(State(state): State<Arc<AppState>>, AxPath(name): AxPath<String>) -> Response {
+async fn package_detail(
+    State(state): State<Arc<AppState>>,
+    AxPath(name): AxPath<String>,
+) -> Response {
     if let Err(resp) = validate_pkg_name(&name) {
         return *resp;
     }
@@ -1752,22 +1865,21 @@ async fn package_detail(State(state): State<Arc<AppState>>, AxPath(name): AxPath
         latest_version: Option<String>,
     }
 
-    let pkg: Option<PackageRow> = match sqlx::query_as(
-        "SELECT id, latest_version FROM packages WHERE name = $1",
-    )
-    .bind(&name)
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select package: {err}"),
-            )
-        }
-    };
+    let pkg: Option<PackageRow> =
+        match sqlx::query_as("SELECT id, latest_version FROM packages WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select package: {err}"),
+                )
+            }
+        };
     let Some(pkg) = pkg else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
@@ -1850,7 +1962,10 @@ struct OwnersResponse {
     owners: Vec<String>,
 }
 
-async fn package_owners_list(State(state): State<Arc<AppState>>, AxPath(name): AxPath<String>) -> Response {
+async fn package_owners_list(
+    State(state): State<Arc<AppState>>,
+    AxPath(name): AxPath<String>,
+) -> Response {
     if let Err(resp) = validate_pkg_name(&name) {
         return *resp;
     }
@@ -1989,20 +2104,21 @@ async fn package_owner_add(
         }
     }
 
-    let new_owner_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM users WHERE handle = $1")
-        .bind(&handle)
-        .fetch_optional(&mut *tx)
-        .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select user: {err}"),
-            )
-        }
-    };
+    let new_owner_id: Option<Uuid> =
+        match sqlx::query_scalar("SELECT id FROM users WHERE handle = $1")
+            .bind(&handle)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select user: {err}"),
+                )
+            }
+        };
     let Some(new_owner_id) = new_owner_id else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "user not found");
     };
@@ -2175,22 +2291,21 @@ async fn package_owner_remove(
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "owner not found");
     }
 
-    let owners_count: i64 = match sqlx::query_scalar(
-        "SELECT COUNT(*) FROM package_owners WHERE package_id = $1",
-    )
-    .bind(pkg_id)
-    .fetch_one(&mut *tx)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("count owners: {err}"),
-            )
-        }
-    };
+    let owners_count: i64 =
+        match sqlx::query_scalar("SELECT COUNT(*) FROM package_owners WHERE package_id = $1")
+            .bind(pkg_id)
+            .fetch_one(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("count owners: {err}"),
+                )
+            }
+        };
     if owners_count <= 1 {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -2199,11 +2314,12 @@ async fn package_owner_remove(
         );
     }
 
-    if let Err(err) = sqlx::query("DELETE FROM package_owners WHERE package_id = $1 AND user_id = $2")
-        .bind(pkg_id)
-        .bind(owner_id)
-        .execute(&mut *tx)
-        .await
+    if let Err(err) =
+        sqlx::query("DELETE FROM package_owners WHERE package_id = $1 AND user_id = $2")
+            .bind(pkg_id)
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await
     {
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2300,22 +2416,21 @@ async fn package_yank(
         latest_version: Option<String>,
     }
 
-    let pkg: Option<PackageRow> = match sqlx::query_as(
-        "SELECT id, latest_version FROM packages WHERE name = $1",
-    )
-    .bind(&name)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select package: {err}"),
-            )
-        }
-    };
+    let pkg: Option<PackageRow> =
+        match sqlx::query_as("SELECT id, latest_version FROM packages WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select package: {err}"),
+                )
+            }
+        };
     let Some(pkg) = pkg else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
@@ -2493,6 +2608,7 @@ struct PackageMetadataResponse {
 
 async fn package_metadata(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     AxPath((name, version)): AxPath<(String, String)>,
 ) -> Response {
     if let Err(resp) = validate_pkg_name(&name) {
@@ -2533,7 +2649,14 @@ async fn package_metadata(
     let Some(row) = row else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
-    let pkg: PackageManifest = match serde_json::from_value(row.manifest) {
+
+    let MetaRow { manifest, cksum } = row;
+    let etag = format!("\"{}\"", cksum.as_str());
+    if if_none_match(&headers, &etag) {
+        return response_not_modified(&etag, CACHE_CONTROL_PACKAGE_METADATA);
+    }
+
+    let pkg: PackageManifest = match serde_json::from_value(manifest) {
         Ok(v) => v,
         Err(err) => {
             return json_error(
@@ -2544,11 +2667,13 @@ async fn package_metadata(
         }
     };
 
-    ok_json(PackageMetadataResponse {
+    let mut resp = ok_json(PackageMetadataResponse {
         ok: true,
         package: pkg,
-        cksum: row.cksum,
-    })
+        cksum,
+    });
+    set_cache_headers(&mut resp, &etag, CACHE_CONTROL_PACKAGE_METADATA);
+    resp
 }
 
 pub async fn app() -> Router {
@@ -2621,8 +2746,8 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/index", get(index_prefix_redirect))
-        .route("/index/", get(index_prefix_redirect))
+        .route("/index", get(index_no_slash_redirect))
+        .route("/index/", get(index_root_redirect))
         .route("/index/config.json", get(index_config))
         .route("/index/{*path}", get(index_file))
         .route("/config.json", get(index_config_root))
@@ -2651,6 +2776,7 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         )
         .route("/v1/packages/{name}/{version}/yank", post(package_yank))
         .with_state(state);
+    let app = app.layer(from_fn(request_id_middleware));
     match cors {
         Some(cors) => app.layer(cors),
         None => app,

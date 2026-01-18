@@ -171,6 +171,7 @@ async fn s3_backend_publish_creates_index_and_download() {
         bootstrap_token: Some("bootstrap".to_string()),
         cors_origins: Vec::new(),
         storage: x07_registry::RegistryStorageConfig::S3(s3_cfg),
+        verified_namespaces: Vec::new(),
     })
     .await;
 

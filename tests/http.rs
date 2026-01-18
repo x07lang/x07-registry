@@ -1,3 +1,4 @@
+use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH, LOCATION};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -97,6 +98,7 @@ async fn healthz_is_ok() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
     let resp = app
@@ -124,6 +126,7 @@ async fn index_config_is_ok() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
     let resp = app
@@ -144,6 +147,49 @@ async fn index_config_is_ok() {
 }
 
 #[tokio::test]
+async fn index_root_redirects_to_catalog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(x07_registry::RegistryConfig {
+        public_base: "http://127.0.0.1:8080".to_string(),
+        database_url,
+        database_schema,
+        bootstrap_token: None,
+        cors_origins: Vec::new(),
+        storage: x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        verified_namespaces: Vec::new(),
+    })
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(resp.headers().get(LOCATION).unwrap(), "/index/");
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/index/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.headers().get(LOCATION).unwrap(), "/index/catalog.json");
+}
+
+#[tokio::test]
 async fn index_config_auth_required_is_false_even_when_publish_requires_token() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (database_url, database_schema) = create_test_schema().await;
@@ -156,6 +202,7 @@ async fn index_config_auth_required_is_false_even_when_publish_requires_token() 
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
     let resp = app
@@ -186,6 +233,7 @@ async fn cors_allows_configured_origin_for_get_requests() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
     let resp = app
@@ -222,6 +270,7 @@ async fn publish_creates_index_and_download() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
 
@@ -274,11 +323,39 @@ async fn publish_creates_index_and_download() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(CACHE_CONTROL)
+            .expect("cache-control")
+            .to_str()
+            .expect("cache-control str"),
+        "public, max-age=300"
+    );
+    let index_etag = resp
+        .headers()
+        .get(ETAG)
+        .expect("etag")
+        .to_str()
+        .expect("etag str")
+        .to_string();
     let index_body = resp.into_body().collect().await.unwrap().to_bytes();
     let index_text = String::from_utf8(index_body.to_vec()).expect("index utf-8");
     assert!(index_text.contains("\"name\":\"hello\""));
     assert!(index_text.contains("\"version\":\"0.1.0\""));
     assert!(index_text.contains(cksum));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(index_path)
+                .header(IF_NONE_MATCH, index_etag.as_str())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 
     let resp = app
         .clone()
@@ -291,6 +368,21 @@ async fn publish_creates_index_and_download() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(CACHE_CONTROL)
+            .expect("cache-control")
+            .to_str()
+            .expect("cache-control str"),
+        "public, max-age=300"
+    );
+    let catalog_etag = resp
+        .headers()
+        .get(ETAG)
+        .expect("etag")
+        .to_str()
+        .expect("etag str")
+        .to_string();
     let json = read_body_json(resp.into_body()).await;
     assert_eq!(
         json["schema_version"],
@@ -305,6 +397,19 @@ async fn publish_creates_index_and_download() {
         json["packages"][0]["latest"],
         Value::String("0.1.0".to_string())
     );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/catalog.json")
+                .header(IF_NONE_MATCH, catalog_etag.as_str())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 
     let resp = app
         .clone()
@@ -331,10 +436,39 @@ async fn publish_creates_index_and_download() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(CACHE_CONTROL)
+            .expect("cache-control")
+            .to_str()
+            .expect("cache-control str"),
+        "public, max-age=60"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(ETAG)
+            .expect("etag")
+            .to_str()
+            .expect("etag str"),
+        format!("\"{cksum}\"")
+    );
     let json = read_body_json(resp.into_body()).await;
     assert_eq!(json["ok"], Value::Bool(true));
     assert_eq!(json["cksum"], Value::String(cksum.to_string()));
     assert_eq!(json["package"]["name"], Value::String("hello".to_string()));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello/0.1.0/metadata")
+                .header(IF_NONE_MATCH, format!("\"{cksum}\""))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 }
 
 #[tokio::test]
@@ -350,6 +484,7 @@ async fn publish_requires_token_when_configured() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
 
@@ -411,6 +546,7 @@ async fn tokens_owners_and_yank_flow_is_ok() {
         storage: x07_registry::RegistryStorageConfig::Filesystem {
             data_dir: tmp.path().to_path_buf(),
         },
+        verified_namespaces: Vec::new(),
     })
     .await;
 
@@ -439,7 +575,9 @@ async fn tokens_owners_and_yank_flow_is_ok() {
                 .uri("/v1/admin/bootstrap")
                 .header("Authorization", "Bearer bootstrap")
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(r#"{"handle":"bob","scopes":["publish"]}"#))
+                .body(axum::body::Body::from(
+                    r#"{"handle":"bob","scopes":["publish"]}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -538,8 +676,15 @@ async fn tokens_owners_and_yank_flow_is_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let index_text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec())
-        .expect("index utf-8");
+    let index_text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("index utf-8");
     assert!(index_text.contains("\"version\":\"0.2.0\""));
     assert!(index_text.contains("\"yanked\":true"));
 

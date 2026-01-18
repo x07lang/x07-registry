@@ -337,7 +337,15 @@
           { "name": "next", "in": "query", "required": false, "schema": { "type": "string" } }
         ],
         "responses": {
-          "302": { "description": "Redirect to GitHub" }
+          "302": { "description": "Redirect to GitHub" },
+          "400": {
+            "description": "OAuth disabled or invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
         }
       }
     },
@@ -348,7 +356,15 @@
           { "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }
         ],
         "responses": {
-          "302": { "description": "Set session cookie and redirect" }
+          "302": { "description": "Set session cookie and redirect" },
+          "400": {
+            "description": "OAuth disabled or invalid request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
         }
       }
     },

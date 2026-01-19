@@ -6,8 +6,8 @@ use std::{collections::HashSet, time::Duration};
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
-    LOCATION, SET_COOKIE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ETAG, HOST, IF_NONE_MATCH, LOCATION,
+    ORIGIN, SET_COOKIE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
@@ -38,6 +38,7 @@ const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=60";
 const CSRF_HEADER_NAME: &str = "x-x07-csrf";
 const SESSION_COOKIE_NAME: &str = "x07_session";
 const USER_AGENT: &str = "x07-registry";
+const OPENAPI_JSON: &str = include_str!("../openapi/openapi.json");
 
 fn current_request_id() -> String {
     REQUEST_ID
@@ -175,9 +176,9 @@ impl RegistryConfig {
                 if trimmed.is_empty() {
                     continue;
                 }
-                let id: i64 = trimmed
-                    .parse()
-                    .unwrap_or_else(|_| panic!("invalid X07_REGISTRY_ADMIN_GITHUB_USER_IDS entry: {trimmed:?}"));
+                let id: i64 = trimmed.parse().unwrap_or_else(|_| {
+                    panic!("invalid X07_REGISTRY_ADMIN_GITHUB_USER_IDS entry: {trimmed:?}")
+                });
                 admin_github_user_ids.insert(id);
             }
         }
@@ -612,8 +613,13 @@ fn is_valid_db_schema_name(schema: &str) -> bool {
 
 #[derive(Debug, Clone)]
 enum AuthKind {
-    Token { token_id: Uuid },
-    Session { session_id: Uuid, csrf_token: String },
+    Token {
+        token_id: Uuid,
+    },
+    Session {
+        session_id: Uuid,
+        csrf_token: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -919,6 +925,29 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+async fn root() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "service": "x07-registry",
+        "healthz": "/healthz",
+        "index": "/index/",
+        "catalog": "/index/catalog.json",
+        "openapi": "/openapi/openapi.json",
+        "web": "https://x07.io"
+    }))
+}
+
+async fn openapi_root_redirect() -> impl IntoResponse {
+    Redirect::to("/openapi/openapi.json")
+}
+
+async fn openapi_json() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        OPENAPI_JSON,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubStartParams {
     next: Option<String>,
@@ -963,8 +992,8 @@ async fn auth_github_start(
         Err(resp) => return *resp,
     };
 
-    let expires_at = Utc::now()
-        + chrono::Duration::seconds(state.cfg.oauth_state_ttl_seconds.max(1).min(3600));
+    let expires_at =
+        Utc::now() + chrono::Duration::seconds(state.cfg.oauth_state_ttl_seconds.clamp(1, 3600));
 
     let oauth_state = {
         let mut rng = rand::rngs::OsRng;
@@ -974,12 +1003,13 @@ async fn auth_github_start(
         state
     };
 
-    if let Err(err) = sqlx::query("INSERT INTO oauth_states(state, next_url, expires_at) VALUES ($1, $2, $3)")
-        .bind(&oauth_state)
-        .bind(&next_path)
-        .bind(expires_at)
-        .execute(&state.db)
-        .await
+    if let Err(err) =
+        sqlx::query("INSERT INTO oauth_states(state, next_url, expires_at) VALUES ($1, $2, $3)")
+            .bind(&oauth_state)
+            .bind(&next_path)
+            .bind(expires_at)
+            .execute(&state.db)
+            .await
     {
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1056,10 +1086,9 @@ struct UserRow {
 }
 
 fn cookie_session_set(cfg: &RegistryConfig, value: &str) -> String {
-    let max_age = cfg.session_ttl_seconds.max(1).min(60 * 60 * 24 * 365);
-    let mut out = format!(
-        "{SESSION_COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
-    );
+    let max_age = cfg.session_ttl_seconds.clamp(1, 60 * 60 * 24 * 365);
+    let mut out =
+        format!("{SESSION_COOKIE_NAME}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax");
     if let Some(domain) = cfg.session_cookie_domain.as_deref() {
         out.push_str(&format!("; Domain={domain}"));
     }
@@ -1070,9 +1099,7 @@ fn cookie_session_set(cfg: &RegistryConfig, value: &str) -> String {
 }
 
 fn cookie_session_clear(cfg: &RegistryConfig) -> String {
-    let mut out = format!(
-        "{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-    );
+    let mut out = format!("{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
     if let Some(domain) = cfg.session_cookie_domain.as_deref() {
         out.push_str(&format!("; Domain={domain}"));
     }
@@ -1126,22 +1153,21 @@ async fn auth_github_callback(
         expires_at: DateTime<Utc>,
     }
 
-    let oauth_state: Option<OauthStateRow> = match sqlx::query_as(
-        "SELECT next_url, expires_at FROM oauth_states WHERE state = $1",
-    )
-    .bind(state_param)
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select oauth state: {err}"),
-            )
-        }
-    };
+    let oauth_state: Option<OauthStateRow> =
+        match sqlx::query_as("SELECT next_url, expires_at FROM oauth_states WHERE state = $1")
+            .bind(state_param)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select oauth state: {err}"),
+                )
+            }
+        };
     let Some(oauth_state) = oauth_state else {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1282,7 +1308,10 @@ async fn auth_github_callback(
         return json_error(
             StatusCode::BAD_GATEWAY,
             "X07REG_GITHUB_OAUTH_EMAILS_REQUEST_FAILED",
-            format!("github emails request failed: HTTP {}", emails_resp.status()),
+            format!(
+                "github emails request failed: HTTP {}",
+                emails_resp.status()
+            ),
         );
     }
     let emails_json: Vec<GithubEmailResponse> = match emails_resp.json().await {
@@ -1325,22 +1354,21 @@ async fn auth_github_callback(
         }
     };
 
-    let mut user_row: Option<UserRow> = match sqlx::query_as(
-        "SELECT id, handle, created_via FROM users WHERE github_user_id = $1",
-    )
-    .bind(user_json.id)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "X07REG_DB",
-                format!("select user by github id: {err}"),
-            )
-        }
-    };
+    let mut user_row: Option<UserRow> =
+        match sqlx::query_as("SELECT id, handle, created_via FROM users WHERE github_user_id = $1")
+            .bind(user_json.id)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select user by github id: {err}"),
+                )
+            }
+        };
 
     if user_row.is_none() {
         user_row = match sqlx::query_as(
@@ -1510,7 +1538,9 @@ async fn auth_github_callback(
         rng.fill_bytes(&mut raw);
         let csrf_token = format!("x07c_{}", sha256_hex(&raw));
         let expires_at = Utc::now()
-            + chrono::Duration::seconds(state.cfg.session_ttl_seconds.max(60).min(60 * 60 * 24 * 365));
+            + chrono::Duration::seconds(
+                state.cfg.session_ttl_seconds.clamp(60, 60 * 60 * 24 * 365),
+            );
         (session_token, session_token_hash, csrf_token, expires_at)
     };
 
@@ -2296,21 +2326,22 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     };
 
     if state.cfg.require_verified_email_for_publish && !auth.scopes.iter().any(|s| s == "admin") {
-        let email_verified: bool =
-            match sqlx::query_scalar::<_, bool>("SELECT github_email_verified FROM users WHERE id = $1")
-                .bind(auth.user_id)
-                .fetch_one(&state.db)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "X07REG_DB",
-                        format!("select email status: {err}"),
-                    )
-                }
-            };
+        let email_verified: bool = match sqlx::query_scalar::<_, bool>(
+            "SELECT github_email_verified FROM users WHERE id = $1",
+        )
+        .bind(auth.user_id)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select email status: {err}"),
+                )
+            }
+        };
         if !email_verified {
             return json_error(
                 StatusCode::FORBIDDEN,
@@ -3703,7 +3734,10 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         http,
     });
     let app = Router::new()
+        .route("/", get(root))
         .route("/healthz", get(healthz))
+        .route("/openapi", get(openapi_root_redirect))
+        .route("/openapi/openapi.json", get(openapi_json))
         .route("/index", get(index_no_slash_redirect))
         .route("/index/", get(index_root_redirect))
         .route("/index/config.json", get(index_config))

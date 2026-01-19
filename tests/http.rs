@@ -111,7 +111,10 @@ async fn create_user_with_token(
         format!("x07t_{}", sha256_hex(&raw))
     };
     let token_hash = sha256_hex(token.as_bytes());
-    let scopes = scopes.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let scopes = scopes
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
 
     sqlx::query("INSERT INTO tokens(user_id, token_hash, label, scopes) VALUES ($1, $2, '', $3)")
         .bind(user_id)

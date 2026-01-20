@@ -1823,22 +1823,34 @@ async fn index_file(
         struct CatalogRow {
             name: String,
             latest_version: Option<String>,
+            description: Option<String>,
+            docs: Option<String>,
         }
 
-        let rows: Vec<CatalogRow> =
-            match sqlx::query_as("SELECT name, latest_version FROM packages ORDER BY name ASC")
-                .fetch_all(&state.db)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "X07REG_DB",
-                        format!("select catalog: {err}"),
-                    )
-                }
-            };
+        let rows: Vec<CatalogRow> = match sqlx::query_as(
+            r#"
+            SELECT
+                p.name,
+                p.latest_version,
+                pv.manifest->>'description' AS description,
+                pv.manifest->>'docs' AS docs
+            FROM packages p
+            LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            ORDER BY p.name ASC
+            "#,
+        )
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("select catalog: {err}"),
+                )
+            }
+        };
         let catalog = IndexCatalog {
             schema_version: "x07.index-catalog@0.1.0".to_string(),
             packages: rows
@@ -1846,6 +1858,8 @@ async fn index_file(
                 .map(|r| IndexCatalogPackage {
                     name: r.name,
                     latest: r.latest_version,
+                    description: r.description,
+                    docs: r.docs,
                 })
                 .collect(),
         };
@@ -2324,6 +2338,10 @@ struct IndexCatalogPackage {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docs: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2396,6 +2414,26 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     }
     if let Err(resp) = validate_version(&manifest.version) {
         return *resp;
+    }
+    if manifest
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_PKG_DESCRIPTION_REQUIRED",
+            "x07-package.json must include a non-empty \"description\" field",
+        );
+    }
+    if manifest.docs.as_deref().unwrap_or("").trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_PKG_DOCS_REQUIRED",
+            "x07-package.json must include a non-empty \"docs\" field",
+        );
     }
 
     let _publish_guard = state.publish_lock.lock().await;

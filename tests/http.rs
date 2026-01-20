@@ -155,6 +155,8 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
     let manifest = serde_json::json!({
         "schema_version": "x07.package@0.1.0",
         "name": name,
+        "description": "Test package used by x07-registry integration tests.",
+        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
         "version": version,
         "module_root": "modules",
         "modules": ["hello.util"],

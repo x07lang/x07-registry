@@ -202,9 +202,11 @@
           "schema_version": { "type": "string" },
           "name": { "type": "string" },
           "description": { "type": "string" },
+          "docs": { "type": "string" },
           "version": { "type": "string" },
           "module_root": { "type": "string" },
-          "modules": { "type": "array", "items": { "type": "string" } }
+          "modules": { "type": "array", "items": { "type": "string" } },
+          "meta": { "type": "object" }
         }
       },
       "PublishResponse": {

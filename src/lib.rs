@@ -1890,11 +1890,18 @@ async fn index_file(
         version: String,
         cksum: String,
         yanked: bool,
+        description: Option<String>,
+        docs: Option<String>,
     }
 
     let mut versions: Vec<VersionRow> = match sqlx::query_as(
         r#"
-        SELECT pv.version, pv.cksum, pv.yanked
+        SELECT
+            pv.version,
+            pv.cksum,
+            pv.yanked,
+            pv.manifest->>'description' AS description,
+            pv.manifest->>'docs' AS docs
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         WHERE p.name = $1
@@ -1936,6 +1943,8 @@ async fn index_file(
             version: row.version.clone(),
             cksum: row.cksum.clone(),
             yanked: row.yanked,
+            description: row.description.clone(),
+            docs: row.docs.clone(),
         };
         out.push_str(&serde_json::to_string(&line).expect("serialize index entry"));
         out.push('\n');
@@ -2292,9 +2301,13 @@ struct PackageManifest {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    docs: Option<String>,
     version: String,
     module_root: String,
     modules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2363,7 +2376,7 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     };
 
     let cksum = sha256_hex(&bytes);
-    let (manifest, _manifest_bytes) = match read_package_manifest_from_tar(&bytes) {
+    let (manifest, manifest_bytes) = match read_package_manifest_from_tar(&bytes) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -2560,14 +2573,14 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         );
     }
 
-    let manifest_json = match serde_json::to_value(&manifest) {
+    let manifest_json = match serde_json::from_slice::<serde_json::Value>(&manifest_bytes) {
         Ok(v) => v,
         Err(err) => {
             let _ = state.store.delete(&dl_key).await;
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "X07REG_INTERNAL",
-                format!("serialize manifest: {err}"),
+                format!("parse manifest: {err}"),
             );
         }
     };
@@ -2658,6 +2671,10 @@ struct IndexEntryLine {
     cksum: String,
     #[serde(default)]
     yanked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docs: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

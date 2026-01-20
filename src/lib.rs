@@ -2398,6 +2398,9 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = validate_package_archive_contents(&manifest, &bytes) {
+        return *resp;
+    }
 
     if manifest.schema_version.trim() != "x07.package@0.1.0" {
         return json_error(
@@ -3949,6 +3952,148 @@ fn read_package_manifest_from_tar(tar_bytes: &[u8]) -> ApiResult<(PackageManifes
         "X07REG_BAD_ARCHIVE",
         "missing x07-package.json",
     ))
+}
+
+fn validate_package_archive_contents(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResult<()> {
+    let module_root = manifest.module_root.trim();
+    if module_root.is_empty() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            "x07-package.json module_root must be non-empty",
+        ));
+    }
+
+    let module_root_path = Path::new(module_root);
+    if module_root_path.is_absolute() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            format!("x07-package.json module_root must be relative: {module_root:?}"),
+        ));
+    }
+    for c in module_root_path.components() {
+        match c {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::CurDir
+            | std::path::Component::ParentDir => {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_BAD_MANIFEST",
+                    format!("x07-package.json module_root must be a clean relative path: {module_root:?}"),
+                ));
+            }
+            std::path::Component::Normal(_) => {}
+        }
+    }
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut files: HashSet<PathBuf> = HashSet::new();
+    for entry in archive.entries().map_err(|e| {
+        boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_ARCHIVE",
+            format!("read tar entries: {e}"),
+        )
+    })? {
+        let entry = entry.map_err(|e| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!("read tar entry: {e}"),
+            )
+        })?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().map_err(|e| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!("read tar entry path: {e}"),
+            )
+        })?;
+        if path.as_os_str().is_empty() || path.is_absolute() {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!("invalid tar entry path: {:?}", path),
+            ));
+        }
+        for c in path.components() {
+            match c {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir => {
+                    return Err(boxed_json_error(
+                        StatusCode::BAD_REQUEST,
+                        "X07REG_BAD_ARCHIVE",
+                        format!("invalid tar entry path: {:?}", path),
+                    ));
+                }
+                std::path::Component::Normal(_) => {}
+            }
+        }
+        files.insert(path.into_owned());
+    }
+
+    if manifest.modules.is_empty() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            "x07-package.json modules must be non-empty",
+        ));
+    }
+
+    for module_id in &manifest.modules {
+        let rel = format!("{}.x07.json", module_id.replace('.', "/"));
+        let expected = module_root_path.join(rel);
+        for c in expected.components() {
+            match c {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir => {
+                    return Err(boxed_json_error(
+                        StatusCode::BAD_REQUEST,
+                        "X07REG_BAD_MANIFEST",
+                        format!("invalid module id path for {module_id:?}"),
+                    ));
+                }
+                std::path::Component::Normal(_) => {}
+            }
+        }
+        if !files.contains(&expected) {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!(
+                    "package archive missing module file for {module_id:?}: {}",
+                    expected.display()
+                ),
+            ));
+        }
+    }
+
+    let import_mode_ffi = manifest
+        .meta
+        .as_ref()
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get("import_mode"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "ffi")
+        .unwrap_or(false);
+    if import_mode_ffi && !files.iter().any(|p| p.starts_with("ffi")) {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_ARCHIVE",
+            "package archive missing ffi/ directory (required when meta.import_mode == \"ffi\")",
+        ));
+    }
+
+    Ok(())
 }
 
 fn index_relative_path(name: &str) -> ApiResult<String> {

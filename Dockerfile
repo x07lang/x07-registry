@@ -5,6 +5,7 @@ FROM rust:1.91.0-slim-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY openapi ./openapi
 COPY migrations ./migrations
 
 RUN cargo build --release

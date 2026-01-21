@@ -7,6 +7,12 @@ This repo contains the X07 package registry server (API) and its contract.
 - API contract: `openapi/openapi.json`
 - Auth notes: `docs/auth.md`
 
+## End-user docs
+
+- Toolchain + agent workflow: https://x07lang.org/docs/getting-started/agent-quickstart/
+- Packages: https://x07lang.org/docs/packages/
+- Registry UI: https://x07.io/
+
 ## Run locally
 
 Prereqs:

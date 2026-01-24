@@ -10,6 +10,7 @@ This repo contains the X07 package registry server (API) and its contract.
 ## End-user docs
 
 - Toolchain + agent workflow: https://x07lang.org/docs/getting-started/agent-quickstart/
+- Agent contracts (canonical machine endpoints): https://x07lang.org/docs/agent/contract/
 - Installer / x07up: https://x07lang.org/docs/getting-started/installer/
 - Packages: https://x07lang.org/docs/packages/
 - Registry UI: https://x07.io/

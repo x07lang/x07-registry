@@ -2,6 +2,8 @@
 
 This repo contains the X07 package registry server (API) and its contract.
 
+Support: see `SUPPORT.md`.
+
 ## Contents
 
 - API contract: `openapi/openapi.json`

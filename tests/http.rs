@@ -152,6 +152,11 @@ fn base_config(
 }
 
 fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
+    let module_bytes = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.2.0"}"#.to_vec();
+    make_tar_with_package_with_module(name, version, module_bytes)
+}
+
+fn make_tar_with_package_with_module(name: &str, version: &str, module_bytes: Vec<u8>) -> Vec<u8> {
     let manifest = serde_json::json!({
         "schema_version": "x07.package@0.1.0",
         "name": name,
@@ -162,8 +167,6 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
         "modules": ["hello.util"],
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
-
-    let module_bytes = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.1.0"}"#.to_vec();
 
     let mut buf = Vec::new();
     {
@@ -559,6 +562,47 @@ async fn publish_creates_index_and_download() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn publish_rejects_invalid_x07ast() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let tar = make_tar_with_package_with_module("hello", "0.1.0", b"not-json".to_vec());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["code"],
+        Value::String("X07REG_PUBLISH_LINT_FAILED".to_string())
+    );
+    assert!(json["message"]
+        .as_str()
+        .expect("message str")
+        .contains("invalid JSON"));
 }
 
 #[tokio::test]

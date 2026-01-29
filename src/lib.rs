@@ -1,7 +1,11 @@
+use std::io::Cursor;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxPath, Query, State};
@@ -25,6 +29,7 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
+use x07_worlds::WorldId;
 
 type ApiError = Box<Response>;
 type ApiResult<T> = Result<T, ApiError>;
@@ -2439,6 +2444,10 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         );
     }
 
+    if let Err(resp) = lint_package_archive(&manifest, &bytes) {
+        return *resp;
+    }
+
     let _publish_guard = state.publish_lock.lock().await;
 
     let pkg_name = &manifest.name;
@@ -3954,7 +3963,10 @@ fn read_package_manifest_from_tar(tar_bytes: &[u8]) -> ApiResult<(PackageManifes
     ))
 }
 
-fn validate_package_archive_contents(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResult<()> {
+fn validate_package_archive_contents(
+    manifest: &PackageManifest,
+    tar_bytes: &[u8],
+) -> ApiResult<()> {
     let module_root = manifest.module_root.trim();
     if module_root.is_empty() {
         return Err(boxed_json_error(
@@ -4094,6 +4106,235 @@ fn validate_package_archive_contents(manifest: &PackageManifest, tar_bytes: &[u8
     }
 
     Ok(())
+}
+
+fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResult<()> {
+    let worlds = manifest_worlds_allowed(manifest)?;
+    let module_root_path = Path::new(manifest.module_root.trim());
+
+    let mut module_paths: Vec<(&str, PathBuf)> = Vec::with_capacity(manifest.modules.len());
+    let mut wanted: HashSet<PathBuf> = HashSet::with_capacity(manifest.modules.len());
+    for module_id in &manifest.modules {
+        let rel = format!("{}.x07.json", module_id.replace('.', "/"));
+        let path = module_root_path.join(rel);
+        module_paths.push((module_id.as_str(), path.clone()));
+        wanted.insert(path);
+    }
+
+    let mut module_bytes: HashMap<&str, Vec<u8>> = HashMap::with_capacity(module_paths.len());
+    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
+    for entry in archive.entries().map_err(|e| {
+        boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_ARCHIVE",
+            format!("read tar entries: {e}"),
+        )
+    })? {
+        let mut entry = entry.map_err(|e| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!("read tar entry: {e}"),
+            )
+        })?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let path = entry
+            .path()
+            .map_err(|e| {
+                boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_BAD_ARCHIVE",
+                    format!("read tar entry path: {e}"),
+                )
+            })?
+            .into_owned();
+        if !wanted.contains(&path) {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!("read {}: {e}", path.display()),
+            )
+        })?;
+
+        let Some((module_id, _path)) = module_paths.iter().find(|(_, p)| p == &path) else {
+            continue;
+        };
+        module_bytes.insert(module_id, bytes);
+    }
+
+    let mut files: Vec<(&str, x07c::x07ast::X07AstFile)> = Vec::with_capacity(module_paths.len());
+    for (module_id, path) in &module_paths {
+        let bytes = module_bytes.get(module_id).ok_or_else(|| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_ARCHIVE",
+                format!(
+                    "package archive missing module file for {module_id:?}: {}",
+                    path.display()
+                ),
+            )
+        })?;
+        let file = x07c::x07ast::parse_x07ast_json(bytes).map_err(|e| {
+            boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_PUBLISH_LINT_FAILED",
+                format!("module {module_id:?} failed to parse as x07AST: {e}"),
+            )
+        })?;
+        if file.kind != x07c::x07ast::X07AstKind::Module {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_PUBLISH_LINT_FAILED",
+                format!("module {module_id:?} must have kind=\"module\""),
+            ));
+        }
+        if file.module_id != *module_id {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_PUBLISH_LINT_FAILED",
+                format!(
+                    "module file {module_id:?} has mismatched module_id: {:?}",
+                    file.module_id
+                ),
+            ));
+        }
+        files.push((module_id, file));
+    }
+
+    let mut total_errors: usize = 0;
+    let mut shown: Vec<String> = Vec::new();
+    let max_show = 20usize;
+
+    for world in worlds {
+        let options = lint_options_for_world(world);
+        for (module_id, file) in &files {
+            let report = x07c::lint::lint_file(file, options);
+            if report.ok {
+                continue;
+            }
+
+            for d in report
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == x07c::diagnostics::Severity::Error)
+            {
+                total_errors += 1;
+                if shown.len() >= max_show {
+                    continue;
+                }
+                let ptr = d
+                    .loc
+                    .as_ref()
+                    .and_then(|l| match l {
+                        x07c::diagnostics::Location::X07Ast { ptr } => Some(ptr.as_str()),
+                        x07c::diagnostics::Location::Text { .. } => None,
+                    })
+                    .unwrap_or("");
+
+                shown.push(format!(
+                    "[{}] {module_id}: {} {}{}",
+                    world.as_str(),
+                    d.code,
+                    d.message,
+                    if ptr.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" at {ptr}")
+                    }
+                ));
+            }
+        }
+    }
+
+    if total_errors == 0 {
+        return Ok(());
+    }
+
+    let mut msg = format!("x07AST lint failed ({total_errors} error(s)).");
+    if !shown.is_empty() {
+        msg.push_str("\n");
+        msg.push_str(&shown.join("\n"));
+    }
+    Err(boxed_json_error(
+        StatusCode::BAD_REQUEST,
+        "X07REG_PUBLISH_LINT_FAILED",
+        msg,
+    ))
+}
+
+fn manifest_worlds_allowed(manifest: &PackageManifest) -> ApiResult<Vec<WorldId>> {
+    let Some(meta) = manifest.meta.as_ref() else {
+        return Ok(vec![WorldId::SolveFull]);
+    };
+    let Some(meta) = meta.as_object() else {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            "x07-package.json meta must be an object",
+        ));
+    };
+
+    let Some(raw) = meta.get("worlds_allowed") else {
+        return Ok(vec![WorldId::SolveFull]);
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            "x07-package.json meta.worlds_allowed must be an array",
+        ));
+    };
+    if items.is_empty() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_BAD_MANIFEST",
+            "x07-package.json meta.worlds_allowed must be non-empty",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let Some(raw) = item.as_str() else {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_MANIFEST",
+                format!("x07-package.json meta.worlds_allowed[{idx}] must be a string"),
+            ));
+        };
+        let Some(world) = WorldId::parse(raw) else {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_BAD_MANIFEST",
+                format!("x07-package.json meta.worlds_allowed[{idx}] unknown world: {raw:?}"),
+            ));
+        };
+        out.push(world);
+    }
+    out.sort_by_key(|w| w.as_str());
+    out.dedup();
+    Ok(out)
+}
+
+fn lint_options_for_world(world: WorldId) -> x07c::lint::LintOptions {
+    x07c::lint::LintOptions {
+        world,
+        enable_fs: matches!(
+            world,
+            WorldId::SolveFs | WorldId::SolveFull | WorldId::RunOs | WorldId::RunOsSandboxed
+        ),
+        enable_rr: matches!(world, WorldId::SolveRr | WorldId::SolveFull),
+        enable_kv: matches!(world, WorldId::SolveKv | WorldId::SolveFull),
+        allow_unsafe: None,
+        allow_ffi: None,
+    }
 }
 
 fn index_relative_path(name: &str) -> ApiResult<String> {

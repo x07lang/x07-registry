@@ -44,7 +44,7 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
 
-    let module_bytes = br#"{"schema_version":"x07.x07ast@0.2.0","kind":"module","module_id":"hello.util","imports":[],"decls":[]}"#.to_vec();
+    let module_bytes = br#"{"schema_version":"x07.x07ast@0.3.0","kind":"module","module_id":"hello.util","imports":[],"decls":[]}"#.to_vec();
 
     let mut buf = Vec::new();
     {

@@ -210,6 +210,69 @@ fn make_tar_with_package_with_module(name: &str, version: &str, module_bytes: Ve
     buf
 }
 
+fn make_tar_with_package_with_modules(
+    name: &str,
+    version: &str,
+    meta: Option<Value>,
+    modules: Vec<(&str, Vec<u8>)>,
+) -> Vec<u8> {
+    let module_ids: Vec<&str> = modules.iter().map(|(id, _)| *id).collect();
+    let mut manifest = serde_json::json!({
+        "schema_version": "x07.package@0.1.0",
+        "name": name,
+        "description": "Test package used by x07-registry integration tests.",
+        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
+        "version": version,
+        "module_root": "modules",
+        "modules": module_ids,
+    });
+    if let Some(meta) = meta {
+        manifest["meta"] = meta;
+    }
+
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+
+    let mut buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        builder.mode(tar::HeaderMode::Deterministic);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "x07-package.json",
+                std::io::Cursor::new(&manifest_bytes),
+            )
+            .expect("append manifest");
+
+        for (module_id, module_bytes) in modules {
+            let rel = format!("modules/{}.x07.json", module_id.replace('.', "/"));
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(module_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, rel, std::io::Cursor::new(&module_bytes))
+                .expect("append module");
+        }
+
+        builder.finish().expect("finish tar");
+    }
+    buf
+}
+
 #[tokio::test]
 async fn healthz_is_ok() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -562,6 +625,49 @@ async fn publish_creates_index_and_download() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn publish_accepts_mixed_worlds_packages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let pure_module = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let os_module = br#"{"decls":[{"kind":"export","names":["hello.os.read"]},{"body":["os.fs.read_file",["bytes.lit","arch/never_exists.txt"]],"kind":"defn","name":"hello.os.read","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.os","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+
+    let tar = make_tar_with_package_with_modules(
+        "hello",
+        "0.1.0",
+        Some(serde_json::json!({
+            "determinism_tier": "mixed",
+            "worlds_allowed": ["solve-pure", "run-os"]
+        })),
+        vec![("hello.util", pure_module), ("hello.os", os_module)],
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

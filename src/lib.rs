@@ -4213,11 +4213,18 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
     let mut shown: Vec<String> = Vec::new();
     let max_show = 20usize;
 
-    for world in worlds {
-        let options = lint_options_for_world(world);
-        for (module_id, file) in &files {
+    let mut world_has_ok_module: Vec<bool> = vec![false; worlds.len()];
+
+    for (module_id, file) in &files {
+        let mut module_ok_any_world = false;
+        let mut world_only_errors: Vec<String> = Vec::new();
+
+        for (world_idx, &world) in worlds.iter().enumerate() {
+            let options = lint_options_for_world(world);
             let report = x07c::lint::lint_file(file, options);
             if report.ok {
+                module_ok_any_world = true;
+                world_has_ok_module[world_idx] = true;
                 continue;
             }
 
@@ -4226,10 +4233,6 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
                 .iter()
                 .filter(|d| d.severity == x07c::diagnostics::Severity::Error)
             {
-                total_errors += 1;
-                if shown.len() >= max_show {
-                    continue;
-                }
                 let ptr = d
                     .loc
                     .as_ref()
@@ -4238,8 +4241,7 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
                         x07c::diagnostics::Location::Text { .. } => None,
                     })
                     .unwrap_or("");
-
-                shown.push(format!(
+                let line = format!(
                     "[{}] {module_id}: {} {}{}",
                     world.as_str(),
                     d.code,
@@ -4249,8 +4251,51 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
                     } else {
                         format!(" at {ptr}")
                     }
+                );
+
+                if d.code.starts_with("X07-WORLD-") {
+                    world_only_errors.push(line);
+                } else {
+                    total_errors += 1;
+                    if shown.len() < max_show {
+                        shown.push(line);
+                    }
+                }
+            }
+        }
+
+        if module_ok_any_world {
+            continue;
+        }
+
+        if world_only_errors.is_empty() {
+            total_errors += 1;
+            if shown.len() < max_show {
+                shown.push(format!(
+                    "module {module_id:?} failed x07c lint in all allowed worlds"
                 ));
             }
+            continue;
+        }
+
+        for line in world_only_errors {
+            total_errors += 1;
+            if shown.len() < max_show {
+                shown.push(line);
+            }
+        }
+    }
+
+    for (idx, &world) in worlds.iter().enumerate() {
+        if world_has_ok_module[idx] {
+            continue;
+        }
+        total_errors += 1;
+        if shown.len() < max_show {
+            shown.push(format!(
+                "[{}] <manifest>: no modules passed x07c lint",
+                world.as_str()
+            ));
         }
     }
 

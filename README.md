@@ -4,6 +4,11 @@ This repo contains the X07 package registry server (API) and its contract.
 
 Support: see `SUPPORT.md`.
 
+Community:
+
+- Discord: https://discord.gg/59xuEuPN47
+- Email: support@x07lang.org
+
 ## Contents
 
 - API contract: `openapi/openapi.json`
@@ -12,6 +17,8 @@ Support: see `SUPPORT.md`.
 ## End-user docs
 
 - Toolchain + agent workflow: https://x07lang.org/docs/getting-started/agent-quickstart/
+- Why X07: https://x07lang.org/docs/about/
+- FAQ: https://x07lang.org/docs/faq/
 - Agent contracts (canonical machine endpoints): https://x07lang.org/docs/agent/contract/
 - Capability map (canonical package picks): https://x07lang.org/agent/latest/catalog/capabilities.json
 - Installer / x07up: https://x07lang.org/docs/getting-started/installer/

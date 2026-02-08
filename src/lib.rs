@@ -4183,10 +4183,19 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
             )
         })?;
         let file = x07c::x07ast::parse_x07ast_json(bytes).map_err(|e| {
+            let detail = if e.ptr.is_empty() {
+                if e.message.contains("line") && e.message.contains("column") {
+                    format!("invalid JSON: {}", e.message)
+                } else {
+                    format!("invalid x07AST: {}", e.message)
+                }
+            } else {
+                format!("{} at {}", e.message, e.ptr)
+            };
             boxed_json_error(
                 StatusCode::BAD_REQUEST,
                 "X07REG_PUBLISH_LINT_FAILED",
-                format!("module {module_id:?} failed to parse as x07AST: {e}"),
+                format!("module {module_id:?} failed to parse as x07AST: {detail}"),
             )
         })?;
         if file.kind != x07c::x07ast::X07AstKind::Module {

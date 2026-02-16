@@ -24,8 +24,8 @@ tar = "0.4"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-x07-worlds = { git = "https://github.com/x07lang/x07", tag = "v0.1.21", package = "x07-worlds" }
-x07c = { git = "https://github.com/x07lang/x07", tag = "v0.1.21", package = "x07c" }
+x07-worlds = { git = "https://github.com/x07lang/x07", tag = "v0.1.22", package = "x07-worlds" }
+x07c = { git = "https://github.com/x07lang/x07", tag = "v0.1.22", package = "x07c" }
 
 [dev-dependencies]
 http-body-util = "0.1"

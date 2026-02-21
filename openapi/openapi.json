@@ -175,6 +175,89 @@
           "handle": { "type": "string" }
         }
       },
+      "PkgAdvisory": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "id",
+          "package",
+          "version",
+          "kind",
+          "severity",
+          "summary",
+          "created_at_utc"
+        ],
+        "properties": {
+          "schema_version": { "const": "x07.pkg.advisory@0.1.0" },
+          "id": { "type": "string", "format": "uuid" },
+          "package": { "type": "string" },
+          "version": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["broken", "security", "deprecated"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "summary": { "type": "string" },
+          "url": { "type": "string", "format": "uri" },
+          "details": { "type": "string" },
+          "created_at_utc": { "type": "string", "format": "date-time" },
+          "withdrawn_at_utc": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AdvisoriesResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "name", "version", "advisories"],
+        "properties": {
+          "ok": { "const": true },
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "advisories": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PkgAdvisory" }
+          }
+        }
+      },
+      "AdvisoryCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "severity", "summary"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["broken", "security", "deprecated"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "summary": { "type": "string" },
+          "url": { "type": "string", "format": "uri" },
+          "details": { "type": "string" }
+        }
+      },
+      "AdvisoryCreateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "advisory"],
+        "properties": {
+          "ok": { "const": true },
+          "advisory": { "$ref": "#/components/schemas/PkgAdvisory" }
+        }
+      },
+      "AdvisoryWithdrawResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "advisory"],
+        "properties": {
+          "ok": { "const": true },
+          "advisory": { "$ref": "#/components/schemas/PkgAdvisory" }
+        }
+      },
       "YankRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -718,6 +801,125 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/SimpleOkResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packages/{name}/{version}/advisories": {
+      "get": {
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Advisories for the exact package version",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdvisoriesResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "security": [{ "bearerAuth": [] }, { "sessionCookie": [], "csrfHeader": [] }],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AdvisoryCreateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Advisory created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdvisoryCreateResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packages/{name}/{version}/advisories/{id}/withdraw": {
+      "post": {
+        "security": [{ "bearerAuth": [] }, { "sessionCookie": [], "csrfHeader": [] }],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Advisory withdrawn",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AdvisoryWithdrawResponse" }
               }
             }
           },

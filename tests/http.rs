@@ -1,5 +1,6 @@
 use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH, LOCATION};
 use axum::http::{Request, StatusCode};
+use chrono::{Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
 use rand::RngCore;
 use serde_json::Value;
@@ -125,6 +126,43 @@ async fn create_user_with_token(
         .expect("insert token");
 
     token
+}
+
+async fn create_session_for_user(database_url: &str, schema: &str, handle: &str) -> (String, String) {
+    let pool = connect_test_db(database_url, schema).await;
+    let handle = handle.trim().to_ascii_lowercase();
+
+    let user_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE handle = $1")
+        .bind(&handle)
+        .fetch_one(&pool)
+        .await
+        .expect("select user");
+
+    let session_token = {
+        let mut raw = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        format!("x07s_{}", sha256_hex(&raw))
+    };
+    let session_token_hash = sha256_hex(session_token.as_bytes());
+    let csrf_token = {
+        let mut raw = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        format!("x07c_{}", sha256_hex(&raw))
+    };
+    let expires_at = Utc::now() + ChronoDuration::hours(1);
+
+    sqlx::query(
+        "INSERT INTO web_sessions(user_id, session_token_hash, csrf_token, expires_at) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(user_id)
+    .bind(session_token_hash)
+    .bind(&csrf_token)
+    .bind(expires_at)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    (session_token, csrf_token)
 }
 
 fn base_config(
@@ -898,4 +936,218 @@ async fn tokens_owners_and_yank_flow_is_ok() {
         json["packages"][0]["latest"],
         Value::String("0.1.0".to_string())
     );
+}
+
+#[tokio::test]
+async fn advisories_are_in_sparse_index_and_withdraw_hides_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token = create_user_with_token(
+        &database_url,
+        &database_schema,
+        "tester",
+        &["publish", "owner.manage"],
+    )
+    .await;
+
+    let tar = make_tar_with_package("hello", "0.1.0");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/0.1.0/advisories")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"kind":"broken","severity":"high","summary":"Version is broken."}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let advisory_id = json["advisory"]["id"].as_str().expect("advisory id");
+    assert_eq!(
+        json["advisory"]["schema_version"],
+        Value::String("x07.pkg.advisory@0.1.0".to_string())
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/he/ll/hello")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let index_text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("index utf-8");
+    let mut found = false;
+    for line in index_text.lines() {
+        let v: Value = serde_json::from_str(line).expect("parse ndjson line");
+        if v["version"] == "0.1.0" {
+            found = true;
+            let advisories = v["advisories"].as_array().expect("advisories array");
+            assert_eq!(advisories.len(), 1);
+            assert_eq!(advisories[0]["id"], advisory_id);
+            assert_eq!(advisories[0]["kind"], "broken");
+            assert_eq!(advisories[0]["severity"], "high");
+        }
+    }
+    assert!(found, "expected to find hello@0.1.0 index line");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/packages/hello/0.1.0/advisories/{advisory_id}/withdraw"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert!(json["advisory"]["withdrawn_at_utc"].is_string());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/index/he/ll/hello")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let index_text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("index utf-8");
+    for line in index_text.lines() {
+        let v: Value = serde_json::from_str(line).expect("parse ndjson line");
+        if v["version"] == "0.1.0" {
+            assert!(v.get("advisories").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn yank_via_session_requires_csrf_and_is_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        vec!["https://x07.io".to_string()],
+    ))
+    .await;
+
+    let token = create_user_with_token(
+        &database_url,
+        &database_schema,
+        "tester",
+        &["publish", "owner.manage"],
+    )
+    .await;
+
+    let tar = make_tar_with_package("hello", "0.1.0");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (session_token, csrf_token) =
+        create_session_for_user(&database_url, &database_schema, "tester").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/0.1.0/yank")
+                .header("Origin", "https://x07.io")
+                .header("Cookie", format!("x07_session={session_token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"yanked":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/0.1.0/yank")
+                .header("Origin", "https://x07.io")
+                .header("Cookie", format!("x07_session={session_token}"))
+                .header("X-X07-CSRF", csrf_token)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"yanked":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

@@ -43,6 +43,7 @@ const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=60";
 const CSRF_HEADER_NAME: &str = "x-x07-csrf";
 const SESSION_COOKIE_NAME: &str = "x07_session";
 const USER_AGENT: &str = "x07-registry";
+const PKG_ADVISORY_SCHEMA_VERSION: &str = "x07.pkg.advisory@0.1.0";
 const OPENAPI_JSON: &str = include_str!("../openapi/openapi.json");
 
 fn current_request_id() -> String {
@@ -924,6 +925,40 @@ fn actor_token_id(auth: &AuthContext) -> Option<Uuid> {
         AuthKind::Token { token_id } => Some(*token_id),
         AuthKind::Session { .. } => None,
     }
+}
+
+async fn require_package_owner_manage(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pkg_id: Uuid,
+    auth: &AuthContext,
+) -> ApiResult<()> {
+    if auth.scopes.iter().any(|s| s == "admin") {
+        return Ok(());
+    }
+
+    let owner: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM package_owners WHERE package_id = $1 AND user_id = $2",
+    )
+    .bind(pkg_id)
+    .bind(auth.user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|err| {
+        boxed_json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("check owner: {err}"),
+        )
+    })?;
+    if owner.is_none() {
+        return Err(boxed_json_error(
+            StatusCode::FORBIDDEN,
+            "X07REG_FORBIDDEN",
+            "not a package owner",
+        ));
+    }
+
+    Ok(())
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1954,8 +1989,90 @@ async fn index_file(
         }
     });
 
+    #[derive(sqlx::FromRow)]
+    struct AdvisoryRow {
+        id: Uuid,
+        version: String,
+        kind: String,
+        severity: String,
+        summary: String,
+        details: String,
+        url: Option<String>,
+        created_at: DateTime<Utc>,
+    }
+
+    let advisory_rows: Vec<AdvisoryRow> = match sqlx::query_as(
+        r#"
+        SELECT
+            a.id,
+            a.version,
+            a.kind,
+            a.severity,
+            a.summary,
+            a.details,
+            a.url,
+            a.created_at
+        FROM package_version_advisories a
+        JOIN packages p ON p.id = a.package_id
+        WHERE p.name = $1 AND a.withdrawn_at IS NULL
+        ORDER BY a.version ASC, a.created_at ASC, a.id ASC
+        "#,
+    )
+    .bind(name)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select advisories: {err}"),
+            )
+        }
+    };
+
+    let mut advisories_by_version: HashMap<String, Vec<PkgAdvisory>> = HashMap::new();
+    for row in advisory_rows {
+        let Some(kind) = parse_advisory_kind(&row.kind) else {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB_CORRUPT",
+                format!("invalid advisory kind: {:?}", row.kind),
+            );
+        };
+        let Some(severity) = parse_advisory_severity(&row.severity) else {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB_CORRUPT",
+                format!("invalid advisory severity: {:?}", row.severity),
+            );
+        };
+
+        let details = normalize_optional_string(Some(row.details));
+        let url = normalize_optional_string(row.url);
+        let version = row.version;
+        let advisory = PkgAdvisory {
+            schema_version: PKG_ADVISORY_SCHEMA_VERSION.to_string(),
+            id: row.id,
+            package: name.to_string(),
+            version: version.clone(),
+            kind,
+            severity,
+            summary: row.summary,
+            url,
+            details,
+            created_at_utc: row.created_at,
+            withdrawn_at_utc: None,
+        };
+        advisories_by_version.entry(version).or_default().push(advisory);
+    }
+
     let mut out = String::new();
     for row in &versions {
+        let advisories = advisories_by_version
+            .remove(&row.version)
+            .unwrap_or_default();
         let line = IndexEntryLine {
             schema_version: "x07.index-entry@0.1.0".to_string(),
             name: name.to_string(),
@@ -1964,6 +2081,7 @@ async fn index_file(
             yanked: row.yanked,
             description: row.description.clone(),
             docs: row.docs.clone(),
+            advisories,
         };
         out.push_str(&serde_json::to_string(&line).expect("serialize index entry"));
         out.push('\n');
@@ -2713,6 +2831,88 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
     })
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AdvisoryKind {
+    Broken,
+    Security,
+    Deprecated,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AdvisorySeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+fn parse_advisory_kind(value: &str) -> Option<AdvisoryKind> {
+    match value {
+        "broken" => Some(AdvisoryKind::Broken),
+        "security" => Some(AdvisoryKind::Security),
+        "deprecated" => Some(AdvisoryKind::Deprecated),
+        _ => None,
+    }
+}
+
+fn parse_advisory_severity(value: &str) -> Option<AdvisorySeverity> {
+    match value {
+        "low" => Some(AdvisorySeverity::Low),
+        "medium" => Some(AdvisorySeverity::Medium),
+        "high" => Some(AdvisorySeverity::High),
+        "critical" => Some(AdvisorySeverity::Critical),
+        _ => None,
+    }
+}
+
+fn advisory_kind_to_str(value: AdvisoryKind) -> &'static str {
+    match value {
+        AdvisoryKind::Broken => "broken",
+        AdvisoryKind::Security => "security",
+        AdvisoryKind::Deprecated => "deprecated",
+    }
+}
+
+fn advisory_severity_to_str(value: AdvisorySeverity) -> &'static str {
+    match value {
+        AdvisorySeverity::Low => "low",
+        AdvisorySeverity::Medium => "medium",
+        AdvisorySeverity::High => "high",
+        AdvisorySeverity::Critical => "critical",
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PkgAdvisory {
+    schema_version: String,
+    id: Uuid,
+    package: String,
+    version: String,
+    kind: AdvisoryKind,
+    severity: AdvisorySeverity,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    created_at_utc: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdrawn_at_utc: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct IndexEntryLine {
     schema_version: String,
@@ -2725,6 +2925,8 @@ struct IndexEntryLine {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     docs: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    advisories: Vec<PkgAdvisory>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3424,17 +3626,19 @@ async fn package_yank(
     AxPath((name, version)): AxPath<(String, String)>,
     Json(req): Json<YankRequest>,
 ) -> Response {
-    let auth = match require_token(&headers, state.as_ref(), &["owner.manage"]).await {
+    let auth = match require_auth(&headers, state.as_ref(), &["owner.manage"]).await {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
     if let Err(resp) = validate_pkg_name(&name) {
         return *resp;
     }
     if let Err(resp) = validate_version(&version) {
         return *resp;
     }
-    let is_admin = auth.scopes.iter().any(|s| s == "admin");
 
     let mut tx = match state.db.begin().await {
         Ok(v) => v,
@@ -3484,31 +3688,8 @@ async fn package_yank(
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
 
-    if !is_admin {
-        let owner: Option<i32> = match sqlx::query_scalar(
-            "SELECT 1 FROM package_owners WHERE package_id = $1 AND user_id = $2",
-        )
-        .bind(pkg.id)
-        .bind(auth.user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("check owner: {err}"),
-                )
-            }
-        };
-        if owner.is_none() {
-            return json_error(
-                StatusCode::FORBIDDEN,
-                "X07REG_FORBIDDEN",
-                "not a package owner",
-            );
-        }
+    if let Err(resp) = require_package_owner_manage(&mut tx, pkg.id, &auth).await {
+        return *resp;
     }
 
     let updated = match sqlx::query(
@@ -3620,6 +3801,559 @@ async fn package_yank(
         name,
         version,
         yanked: req.yanked,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct AdvisoriesResponse {
+    ok: bool,
+    name: String,
+    version: String,
+    advisories: Vec<PkgAdvisory>,
+}
+
+async fn package_advisories_list(
+    State(state): State<Arc<AppState>>,
+    AxPath((name, version)): AxPath<(String, String)>,
+) -> Response {
+    if let Err(resp) = validate_pkg_name(&name) {
+        return *resp;
+    }
+    if let Err(resp) = validate_version(&version) {
+        return *resp;
+    }
+
+    let pkg_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM packages WHERE name = $1")
+        .bind(&name)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select package: {err}"),
+            )
+        }
+    };
+    let Some(pkg_id) = pkg_id else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    let exists: Option<i32> = match sqlx::query_scalar(
+        "SELECT 1 FROM package_versions WHERE package_id = $1 AND version = $2",
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select version: {err}"),
+            )
+        }
+    };
+    if exists.is_none() {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct AdvisoryRow {
+        id: Uuid,
+        kind: String,
+        severity: String,
+        summary: String,
+        details: String,
+        url: Option<String>,
+        created_at: DateTime<Utc>,
+        withdrawn_at: Option<DateTime<Utc>>,
+    }
+
+    let rows: Vec<AdvisoryRow> = match sqlx::query_as(
+        r#"
+        SELECT id, kind, severity, summary, details, url, created_at, withdrawn_at
+        FROM package_version_advisories
+        WHERE package_id = $1 AND version = $2
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select advisories: {err}"),
+            )
+        }
+    };
+
+    let mut advisories: Vec<PkgAdvisory> = Vec::new();
+    for row in rows {
+        let Some(kind) = parse_advisory_kind(&row.kind) else {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB_CORRUPT",
+                format!("invalid advisory kind: {:?}", row.kind),
+            );
+        };
+        let Some(severity) = parse_advisory_severity(&row.severity) else {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB_CORRUPT",
+                format!("invalid advisory severity: {:?}", row.severity),
+            );
+        };
+        advisories.push(PkgAdvisory {
+            schema_version: PKG_ADVISORY_SCHEMA_VERSION.to_string(),
+            id: row.id,
+            package: name.clone(),
+            version: version.clone(),
+            kind,
+            severity,
+            summary: row.summary,
+            url: normalize_optional_string(row.url),
+            details: normalize_optional_string(Some(row.details)),
+            created_at_utc: row.created_at,
+            withdrawn_at_utc: row.withdrawn_at,
+        });
+    }
+
+    ok_json(AdvisoriesResponse {
+        ok: true,
+        name,
+        version,
+        advisories,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvisoryCreateRequest {
+    kind: AdvisoryKind,
+    severity: AdvisorySeverity,
+    summary: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    details: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdvisoryCreateResponse {
+    ok: bool,
+    advisory: PkgAdvisory,
+}
+
+async fn package_advisory_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxPath((name, version)): AxPath<(String, String)>,
+    Json(req): Json<AdvisoryCreateRequest>,
+) -> Response {
+    let auth = match require_auth(&headers, state.as_ref(), &["owner.manage"]).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
+    if let Err(resp) = validate_pkg_name(&name) {
+        return *resp;
+    }
+    if let Err(resp) = validate_version(&version) {
+        return *resp;
+    }
+
+    let summary = req.summary.trim().to_string();
+    if summary.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_ADVISORY_INVALID",
+            "summary must be non-empty",
+        );
+    }
+
+    let url = normalize_optional_string(req.url);
+    let details = normalize_optional_string(req.details);
+    let details_for_db = details.clone().unwrap_or_default();
+
+    let mut tx = match state.db.begin().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("begin transaction: {err}"),
+            )
+        }
+    };
+    let lock_id = advisory_lock_id(&name);
+    if let Err(err) = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_id)
+        .execute(&mut *tx)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("advisory lock: {err}"),
+        );
+    }
+
+    let pkg_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM packages WHERE name = $1")
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select package: {err}"),
+            )
+        }
+    };
+    let Some(pkg_id) = pkg_id else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    let exists: Option<i32> = match sqlx::query_scalar(
+        "SELECT 1 FROM package_versions WHERE package_id = $1 AND version = $2",
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select version: {err}"),
+            )
+        }
+    };
+    if exists.is_none() {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    }
+
+    if let Err(resp) = require_package_owner_manage(&mut tx, pkg_id, &auth).await {
+        return *resp;
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct InsertRow {
+        id: Uuid,
+        created_at: DateTime<Utc>,
+    }
+
+    let inserted: InsertRow = match sqlx::query_as(
+        r#"
+        INSERT INTO package_version_advisories(package_id, version, kind, severity, summary, details, url, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id, created_at
+        "#,
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .bind(advisory_kind_to_str(req.kind))
+    .bind(advisory_severity_to_str(req.severity))
+    .bind(&summary)
+    .bind(&details_for_db)
+    .bind(&url)
+    .bind(auth.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("insert advisory: {err}"),
+            )
+        }
+    };
+
+    if let Err(err) = sqlx::query(
+        "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version, details) VALUES ($1, $2, 'advisory_created', $3, $4, $5)",
+    )
+    .bind(auth.user_id)
+    .bind(actor_token_id(&auth))
+    .bind(&name)
+    .bind(&version)
+    .bind(serde_json::json!({
+        "advisory_id": inserted.id,
+        "kind": req.kind,
+        "severity": req.severity,
+        "summary": &summary
+    }))
+    .execute(&mut *tx)
+    .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("insert audit: {err}"),
+        );
+    }
+
+    if let Err(err) = tx.commit().await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("commit: {err}"),
+        );
+    }
+
+    ok_json(AdvisoryCreateResponse {
+        ok: true,
+        advisory: PkgAdvisory {
+            schema_version: PKG_ADVISORY_SCHEMA_VERSION.to_string(),
+            id: inserted.id,
+            package: name,
+            version,
+            kind: req.kind,
+            severity: req.severity,
+            summary,
+            url,
+            details,
+            created_at_utc: inserted.created_at,
+            withdrawn_at_utc: None,
+        },
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct AdvisoryWithdrawResponse {
+    ok: bool,
+    advisory: PkgAdvisory,
+}
+
+async fn package_advisory_withdraw(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxPath((name, version, advisory_id)): AxPath<(String, String, Uuid)>,
+) -> Response {
+    let auth = match require_auth(&headers, state.as_ref(), &["owner.manage"]).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = require_csrf(&headers, &auth, &state.cfg) {
+        return *resp;
+    }
+    if let Err(resp) = validate_pkg_name(&name) {
+        return *resp;
+    }
+    if let Err(resp) = validate_version(&version) {
+        return *resp;
+    }
+
+    let mut tx = match state.db.begin().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("begin transaction: {err}"),
+            )
+        }
+    };
+    let lock_id = advisory_lock_id(&name);
+    if let Err(err) = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_id)
+        .execute(&mut *tx)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("advisory lock: {err}"),
+        );
+    }
+
+    let pkg_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM packages WHERE name = $1")
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select package: {err}"),
+            )
+        }
+    };
+    let Some(pkg_id) = pkg_id else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    let exists: Option<i32> = match sqlx::query_scalar(
+        "SELECT 1 FROM package_versions WHERE package_id = $1 AND version = $2",
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select version: {err}"),
+            )
+        }
+    };
+    if exists.is_none() {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    }
+
+    if let Err(resp) = require_package_owner_manage(&mut tx, pkg_id, &auth).await {
+        return *resp;
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct AdvisoryRow {
+        kind: String,
+        severity: String,
+        summary: String,
+        details: String,
+        url: Option<String>,
+        created_at: DateTime<Utc>,
+        withdrawn_at: Option<DateTime<Utc>>,
+    }
+
+    let row: Option<AdvisoryRow> = match sqlx::query_as(
+        r#"
+        SELECT kind, severity, summary, details, url, created_at, withdrawn_at
+        FROM package_version_advisories
+        WHERE id = $1 AND package_id = $2 AND version = $3
+        "#,
+    )
+    .bind(advisory_id)
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select advisory: {err}"),
+            )
+        }
+    };
+    let Some(row) = row else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    let AdvisoryRow {
+        kind: kind_raw,
+        severity: severity_raw,
+        summary,
+        details,
+        url,
+        created_at,
+        withdrawn_at: existing_withdrawn_at,
+    } = row;
+
+    let Some(kind) = parse_advisory_kind(&kind_raw) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB_CORRUPT",
+            format!("invalid advisory kind: {:?}", kind_raw),
+        );
+    };
+    let Some(severity) = parse_advisory_severity(&severity_raw) else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB_CORRUPT",
+            format!("invalid advisory severity: {:?}", severity_raw),
+        );
+    };
+
+    let withdrawn_at = match existing_withdrawn_at {
+        Some(v) => Some(v),
+        None => {
+            let withdrawn_at: DateTime<Utc> = match sqlx::query_scalar(
+            "UPDATE package_version_advisories SET withdrawn_at = now(), withdrawn_by = $1 WHERE id = $2 RETURNING withdrawn_at",
+        )
+        .bind(auth.user_id)
+        .bind(advisory_id)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("withdraw advisory: {err}"),
+                )
+            }
+        };
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version, details) VALUES ($1, $2, 'advisory_withdrawn', $3, $4, $5)",
+        )
+        .bind(auth.user_id)
+        .bind(actor_token_id(&auth))
+        .bind(&name)
+        .bind(&version)
+        .bind(serde_json::json!({ "advisory_id": advisory_id }))
+        .execute(&mut *tx)
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("insert audit: {err}"),
+            );
+        }
+
+            Some(withdrawn_at)
+        }
+    };
+
+    if let Err(err) = tx.commit().await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("commit: {err}"),
+        );
+    }
+
+    ok_json(AdvisoryWithdrawResponse {
+        ok: true,
+        advisory: PkgAdvisory {
+            schema_version: PKG_ADVISORY_SCHEMA_VERSION.to_string(),
+            id: advisory_id,
+            package: name,
+            version,
+            kind,
+            severity,
+            summary,
+            url: normalize_optional_string(url),
+            details: normalize_optional_string(Some(details)),
+            created_at_utc: created_at,
+            withdrawn_at_utc: withdrawn_at,
+        },
     })
 }
 
@@ -3835,6 +4569,14 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .route(
             "/v1/packages/{name}/owners/{handle}",
             delete(package_owner_remove),
+        )
+        .route(
+            "/v1/packages/{name}/{version}/advisories",
+            get(package_advisories_list).post(package_advisory_create),
+        )
+        .route(
+            "/v1/packages/{name}/{version}/advisories/{id}/withdraw",
+            post(package_advisory_withdraw),
         )
         .route("/v1/packages/{name}/{version}/yank", post(package_yank))
         .with_state(state);

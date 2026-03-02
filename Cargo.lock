@@ -1717,6 +1717,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "leb128fmt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+
+[[package]]
 name = "libc"
 version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3353,6 +3359,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9dca005e69bf015e45577e415b9af8c67e8ee3c0e38b5b0add5aa92581ed5c"
+dependencies = [
+ "leb128fmt",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+dependencies = [
+ "bitflags",
+ "indexmap",
+ "semver",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3695,8 +3722,8 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "x07-contracts"
-version = "0.1.43"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.43#ef9cfeb11db5150ab55d604748d0eb9316aa844a"
+version = "0.1.47"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.47#eaf6be2aaa0346bcfcac9fac4ea5b5721bf00d59"
 
 [[package]]
 name = "x07-registry"
@@ -3728,16 +3755,16 @@ dependencies = [
 
 [[package]]
 name = "x07-worlds"
-version = "0.1.43"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.43#ef9cfeb11db5150ab55d604748d0eb9316aa844a"
+version = "0.1.47"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.47#eaf6be2aaa0346bcfcac9fac4ea5b5721bf00d59"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "x07c"
-version = "0.1.43"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.43#ef9cfeb11db5150ab55d604748d0eb9316aa844a"
+version = "0.1.47"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.47#eaf6be2aaa0346bcfcac9fac4ea5b5721bf00d59"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3745,6 +3772,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "wasm-encoder",
  "x07-contracts",
  "x07-worlds",
 ]

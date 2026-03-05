@@ -3722,8 +3722,8 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "x07-contracts"
-version = "0.1.55"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.55#083680129abcca3ce0bf74213ef3201f8bb48074"
+version = "0.1.56"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.56#ad20b0e5aa0af9561d98c1c69dc32059933a46ca"
 
 [[package]]
 name = "x07-registry"
@@ -3755,16 +3755,16 @@ dependencies = [
 
 [[package]]
 name = "x07-worlds"
-version = "0.1.55"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.55#083680129abcca3ce0bf74213ef3201f8bb48074"
+version = "0.1.56"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.56#ad20b0e5aa0af9561d98c1c69dc32059933a46ca"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "x07c"
-version = "0.1.55"
-source = "git+https://github.com/x07lang/x07?tag=v0.1.55#083680129abcca3ce0bf74213ef3201f8bb48074"
+version = "0.1.56"
+source = "git+https://github.com/x07lang/x07?tag=v0.1.56#ad20b0e5aa0af9561d98c1c69dc32059933a46ca"
 dependencies = [
  "anyhow",
  "blake3",

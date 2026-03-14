@@ -1,6 +1,8 @@
 # X07 Registry
 
-This repo contains the X07 package registry server (API) and its contract.
+`x07-registry` is the package registry API for the X07 ecosystem.
+
+This repo is where published X07 packages are stored, indexed, downloaded, and authenticated. In practical terms, it is the server behind the package workflows described in the core `x07` docs and surfaced to users through [`x07.io`](https://x07.io).
 
 Support: see `SUPPORT.md`.
 
@@ -9,47 +11,88 @@ Community:
 - Discord: https://discord.gg/59xuEuPN47
 - Email: support@x07lang.org
 
+## What Is In This Repo
+
+- **Registry API server** implemented in Rust
+- **OpenAPI contract** in `openapi/openapi.json`
+- **Package index endpoints** used by tooling and UI clients
+- **Auth and session handling** for sign-in and publish flows
+- **Operational docs** such as `docs/auth.md`
+
+## Vision
+
+The registry exists to give X07 one consistent package story for both humans and coding agents.
+
+An end user should be able to install the toolchain, add a package, publish a package, and inspect what is available without learning a private workflow. A coding agent should be able to do the same with stable machine-readable endpoints and predictable error handling.
+
+## How It Fits The X07 Ecosystem
+
+- [`x07`](https://github.com/x07lang/x07) is the core toolchain that installs packages, locks dependencies, and publishes packages
+- `x07-registry` is the API that stores and serves those packages
+- [`x07-registry-web`](https://github.com/x07lang/x07-registry-web) is the browser UI for the same registry data
+- [`x07lang.org`](https://x07lang.org/docs/packages/) explains the package workflow from an end-user point of view
+
+That makes this repo part of the language’s everyday developer path, not an optional side service.
+
+## Practical Usage
+
+Use the registry when you need to:
+
+- publish a package for other X07 projects to consume
+- browse package versions and metadata
+- serve the sparse index used by tooling
+- support the `x07 pkg` workflow with a real API backend
+
+## Install And Run Locally
+
+Prereqs:
+
+- Rust toolchain
+- Postgres, or the shared workspace `dev-stack/`
+
+Run the API from the repo root:
+
+```sh
+cargo run
+```
+
+The server listens on `127.0.0.1:8080` and exposes `GET /healthz`.
+
+## Use It As Part Of The Full X07 Workflow
+
+Install the X07 toolchain first:
+
+- Installer: https://x07lang.org/docs/getting-started/installer/
+- Agent quickstart: https://x07lang.org/docs/getting-started/agent-quickstart/
+
+Then pair this repo with:
+
+- [`x07`](https://github.com/x07lang/x07) for `x07 pkg add`, `x07 pkg lock`, and `x07 pkg publish`
+- [`x07-registry-web`](https://github.com/x07lang/x07-registry-web) for the browser experience at `x07.io`
+
+Useful end-user docs:
+
+- Packages overview: https://x07lang.org/docs/packages/
+- Publishing by example: https://x07lang.org/docs/packages/publishing-by-example/
+- Agent contracts: https://x07lang.org/docs/agent/contract/
+- Capability map: https://x07lang.org/agent/latest/catalog/capabilities.json
+
 ## Contents
 
 - API contract: `openapi/openapi.json`
 - Auth notes: `docs/auth.md`
 
-## End-user docs
-
-- Toolchain + agent workflow: https://x07lang.org/docs/getting-started/agent-quickstart/
-- Why X07: https://x07lang.org/docs/about/
-- FAQ: https://x07lang.org/docs/faq/
-- Agent contracts (canonical machine endpoints): https://x07lang.org/docs/agent/contract/
-- Capability map (canonical package picks): https://x07lang.org/agent/latest/catalog/capabilities.json
-- Installer / x07up: https://x07lang.org/docs/getting-started/installer/
-- Packages: https://x07lang.org/docs/packages/
-- Registry UI: https://x07.io/
-- Registry UI repo: https://github.com/x07lang/x07-registry-web
-
-## Run locally
-
-Prereqs:
-
-- Rust toolchain
-- Postgres (or run `dev-stack/` from the workspace root)
-
-Run:
-
-- `cargo run`
-
-The server listens on `127.0.0.1:8080` and exposes `GET /healthz`.
-
-## Index endpoints
+## Index Endpoints
 
 - `GET /index` → redirects to `/index/`
 - `GET /index/` → redirects to `/index/catalog.json`
-- `GET /index/config.json` → sparse index config (includes API + download bases)
+- `GET /index/config.json` → sparse index config with API and download bases
 - `GET /index/catalog.json` → package catalog JSON
-- `GET /index/<prefix>/<name>` → package index entry (NDJSON)
+- `GET /index/<prefix>/<name>` → package index entry in NDJSON form
 
-Index endpoints include `ETag` + `Cache-Control` and support `If-None-Match` revalidation (`304 Not Modified`).
+Index endpoints include `ETag` and `Cache-Control` and support `If-None-Match` revalidation with `304 Not Modified`.
 
-All responses include an `x-request-id` header; JSON error responses include `request_id` alongside `code` and `message`.
+All responses include an `x-request-id` header. JSON error responses include `request_id` alongside `code` and `message`.
 
 ## Configuration
 
@@ -65,12 +108,12 @@ All responses include an `x-request-id` header; JSON error responses include `re
 - `X07_REGISTRY_GITHUB_API_BASE`: override GitHub API base URL (optional; default: `https://api.github.com`)
 - `X07_REGISTRY_ADMIN_GITHUB_USER_IDS`: comma-separated numeric GitHub user IDs treated as admins (optional)
 - `X07_REGISTRY_SESSION_COOKIE_DOMAIN`: cookie domain for `x07_session` (recommended: `.x07.io`)
-- `X07_REGISTRY_SESSION_COOKIE_SECURE`: `true`/`false` for the `Secure` cookie attribute (default: `true`)
+- `X07_REGISTRY_SESSION_COOKIE_SECURE`: `true` or `false` for the `Secure` cookie attribute (default: `true`)
 - `X07_REGISTRY_SESSION_TTL_SECONDS`: session lifetime in seconds (default: 2592000)
 - `X07_REGISTRY_OAUTH_STATE_TTL_SECONDS`: OAuth state lifetime in seconds (default: 600)
 - `X07_REGISTRY_REQUIRE_VERIFIED_EMAIL_FOR_PUBLISH`: require a verified GitHub email to publish (default: `true`)
-- `X07_REGISTRY_STORAGE`: `fs` (filesystem) or `s3` (S3-compatible object storage). Default: `fs`
-- `X07_REGISTRY_VERIFIED_NAMESPACES`: comma-separated list of “official” namespace prefixes (optional)
+- `X07_REGISTRY_STORAGE`: `fs` or `s3` (S3-compatible object storage). Default: `fs`
+- `X07_REGISTRY_VERIFIED_NAMESPACES`: comma-separated list of official namespace prefixes (optional)
 
 Filesystem mode:
 

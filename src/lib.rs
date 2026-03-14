@@ -46,7 +46,7 @@ const SESSION_COOKIE_NAME: &str = "x07_session";
 const USER_AGENT: &str = "x07-registry";
 const PKG_ADVISORY_SCHEMA_VERSION: &str = "x07.pkg.advisory@0.1.0";
 const OPENAPI_JSON: &str = include_str!("../openapi/openapi.json");
-const OFFICIAL_PUBLISHER_HANDLE: &str = "webodik";
+const OFFICIAL_OWNER_HANDLE: &str = "webodik";
 
 fn current_request_id() -> String {
     REQUEST_ID
@@ -1882,16 +1882,20 @@ async fn index_file(
             SELECT
                 p.name,
                 p.latest_version,
-                COALESCE(u.handle = $1, false) AS is_official,
+                EXISTS(
+                    SELECT 1
+                    FROM package_owners o
+                    JOIN users owner_user ON owner_user.id = o.user_id
+                    WHERE o.package_id = p.id AND owner_user.handle = $1
+                ) AS is_official,
                 pv.manifest->>'description' AS description,
                 pv.manifest->>'docs' AS docs
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
-            LEFT JOIN users u ON u.id = p.created_by
             ORDER BY p.name ASC
             "#,
         )
-        .bind(OFFICIAL_PUBLISHER_HANDLE)
+        .bind(OFFICIAL_OWNER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -3012,19 +3016,23 @@ async fn search(
             SELECT
                 p.name,
                 p.latest_version,
-                COALESCE(u.handle = $3, false) AS is_official,
+                EXISTS(
+                    SELECT 1
+                    FROM package_owners o
+                    JOIN users owner_user ON owner_user.id = o.user_id
+                    WHERE o.package_id = p.id AND owner_user.handle = $3
+                ) AS is_official,
                 pv.manifest->>'description' AS description,
                 COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
-            LEFT JOIN users u ON u.id = p.created_by
             ORDER BY p.name ASC
             LIMIT $1 OFFSET $2
             "#,
         )
         .bind(limit as i64)
         .bind(offset as i64)
-        .bind(OFFICIAL_PUBLISHER_HANDLE)
+        .bind(OFFICIAL_OWNER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -3060,12 +3068,16 @@ async fn search(
             SELECT
                 p.name,
                 p.latest_version,
-                COALESCE(u.handle = $4, false) AS is_official,
+                EXISTS(
+                    SELECT 1
+                    FROM package_owners o
+                    JOIN users owner_user ON owner_user.id = o.user_id
+                    WHERE o.package_id = p.id AND owner_user.handle = $4
+                ) AS is_official,
                 pv.manifest->>'description' AS description,
                 COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
-            LEFT JOIN users u ON u.id = p.created_by
             WHERE p.name LIKE $1
             ORDER BY p.name ASC
             LIMIT $2 OFFSET $3
@@ -3074,7 +3086,7 @@ async fn search(
         .bind(&like)
         .bind(limit as i64)
         .bind(offset as i64)
-        .bind(OFFICIAL_PUBLISHER_HANDLE)
+        .bind(OFFICIAL_OWNER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -3144,14 +3156,21 @@ async fn package_detail(
 
     let pkg: Option<PackageRow> = match sqlx::query_as(
         r#"
-        SELECT p.id, p.latest_version, COALESCE(u.handle = $2, false) AS is_official
+        SELECT
+            p.id,
+            p.latest_version,
+            EXISTS(
+                SELECT 1
+                FROM package_owners o
+                JOIN users owner_user ON owner_user.id = o.user_id
+                WHERE o.package_id = p.id AND owner_user.handle = $2
+            ) AS is_official
         FROM packages p
-        LEFT JOIN users u ON u.id = p.created_by
         WHERE p.name = $1
         "#,
     )
     .bind(&name)
-    .bind(OFFICIAL_PUBLISHER_HANDLE)
+    .bind(OFFICIAL_OWNER_HANDLE)
     .fetch_optional(&state.db)
     .await
     {
@@ -3264,14 +3283,20 @@ async fn package_owners_list(
 
     let pkg: Option<PackageOwnershipRow> = match sqlx::query_as(
         r#"
-        SELECT p.id, COALESCE(u.handle = $2, false) AS is_official
+        SELECT
+            p.id,
+            EXISTS(
+                SELECT 1
+                FROM package_owners o
+                JOIN users owner_user ON owner_user.id = o.user_id
+                WHERE o.package_id = p.id AND owner_user.handle = $2
+            ) AS is_official
         FROM packages p
-        LEFT JOIN users u ON u.id = p.created_by
         WHERE p.name = $1
         "#,
     )
     .bind(&name)
-    .bind(OFFICIAL_PUBLISHER_HANDLE)
+    .bind(OFFICIAL_OWNER_HANDLE)
     .fetch_optional(&state.db)
     .await
     {
@@ -4464,16 +4489,23 @@ async fn package_metadata(
 
     let row: Option<MetaRow> = match sqlx::query_as(
         r#"
-        SELECT pv.manifest, pv.cksum, COALESCE(u.handle = $3, false) AS is_official
+        SELECT
+            pv.manifest,
+            pv.cksum,
+            EXISTS(
+                SELECT 1
+                FROM package_owners o
+                JOIN users owner_user ON owner_user.id = o.user_id
+                WHERE o.package_id = p.id AND owner_user.handle = $3
+            ) AS is_official
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
-        LEFT JOIN users u ON u.id = p.created_by
         WHERE p.name = $1 AND pv.version = $2
         "#,
     )
     .bind(&name)
     .bind(&version)
-    .bind(OFFICIAL_PUBLISHER_HANDLE)
+    .bind(OFFICIAL_OWNER_HANDLE)
     .fetch_optional(&state.db)
     .await
     {

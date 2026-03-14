@@ -928,6 +928,13 @@ async fn tokens_owners_and_yank_flow_is_ok() {
     .await;
     let bob_token =
         create_user_with_token(&database_url, &database_schema, "bob", &["publish"]).await;
+    let _webodik_token = create_user_with_token(
+        &database_url,
+        &database_schema,
+        "webodik",
+        &["publish", "owner.manage"],
+    )
+    .await;
 
     let tar = make_tar_with_package("hello", "0.1.0");
     let resp = app
@@ -1007,6 +1014,106 @@ async fn tokens_owners_and_yank_flow_is_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = read_body_json(resp.into_body()).await;
     assert_eq!(json["is_official"], Value::Bool(false));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/owners")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"webodik"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello/owners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["is_official"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=hel")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["packages"][0]["is_official"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/packages/hello/owners/webodik")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello/owners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["is_official"], Value::Bool(false));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/hello/owners")
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(r#"{"handle":"webodik"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=hel")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["packages"][0]["is_official"], Value::Bool(true));
 
     let resp = app
         .clone()

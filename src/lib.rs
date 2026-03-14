@@ -39,12 +39,14 @@ tokio::task_local! {
 }
 
 const CACHE_CONTROL_INDEX: &str = "public, max-age=300";
-const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=60";
+const CACHE_CONTROL_PACKAGE_METADATA: &str = "public, max-age=3600";
+const CACHE_CONTROL_SCHEMA: &str = "public, max-age=3600";
 const CSRF_HEADER_NAME: &str = "x-x07-csrf";
 const SESSION_COOKIE_NAME: &str = "x07_session";
 const USER_AGENT: &str = "x07-registry";
 const PKG_ADVISORY_SCHEMA_VERSION: &str = "x07.pkg.advisory@0.1.0";
 const OPENAPI_JSON: &str = include_str!("../openapi/openapi.json");
+const OFFICIAL_PUBLISHER_HANDLE: &str = "webodik";
 
 fn current_request_id() -> String {
     REQUEST_ID
@@ -936,20 +938,19 @@ async fn require_package_owner_manage(
         return Ok(());
     }
 
-    let owner: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM package_owners WHERE package_id = $1 AND user_id = $2",
-    )
-    .bind(pkg_id)
-    .bind(auth.user_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| {
-        boxed_json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "X07REG_DB",
-            format!("check owner: {err}"),
-        )
-    })?;
+    let owner: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM package_owners WHERE package_id = $1 AND user_id = $2")
+            .bind(pkg_id)
+            .bind(auth.user_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|err| {
+                boxed_json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "X07REG_DB",
+                    format!("check owner: {err}"),
+                )
+            })?;
     if owner.is_none() {
         return Err(boxed_json_error(
             StatusCode::FORBIDDEN,
@@ -980,12 +981,20 @@ async fn openapi_root_redirect() -> impl IntoResponse {
     Redirect::to("/openapi/openapi.json")
 }
 
-async fn openapi_json() -> impl IntoResponse {
-    (
+async fn openapi_json(headers: HeaderMap) -> Response {
+    let etag = format!("\"{}\"", sha256_hex(OPENAPI_JSON.as_bytes()));
+    if if_none_match(&headers, &etag) {
+        return response_not_modified(&etag, CACHE_CONTROL_SCHEMA);
+    }
+
+    let mut resp = (
         StatusCode::OK,
         [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
         OPENAPI_JSON,
     )
+        .into_response();
+    set_cache_headers(&mut resp, &etag, CACHE_CONTROL_SCHEMA);
+    resp
 }
 
 #[derive(Debug, Deserialize)]
@@ -1863,6 +1872,7 @@ async fn index_file(
         struct CatalogRow {
             name: String,
             latest_version: Option<String>,
+            is_official: bool,
             description: Option<String>,
             docs: Option<String>,
         }
@@ -1872,13 +1882,16 @@ async fn index_file(
             SELECT
                 p.name,
                 p.latest_version,
+                COALESCE(u.handle = $1, false) AS is_official,
                 pv.manifest->>'description' AS description,
                 pv.manifest->>'docs' AS docs
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            LEFT JOIN users u ON u.id = p.created_by
             ORDER BY p.name ASC
             "#,
         )
+        .bind(OFFICIAL_PUBLISHER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -1897,6 +1910,7 @@ async fn index_file(
                 .into_iter()
                 .map(|r| IndexCatalogPackage {
                     name: r.name,
+                    is_official: r.is_official,
                     latest: r.latest_version,
                     description: r.description,
                     docs: r.docs,
@@ -2065,7 +2079,10 @@ async fn index_file(
             created_at_utc: row.created_at,
             withdrawn_at_utc: None,
         };
-        advisories_by_version.entry(version).or_default().push(advisory);
+        advisories_by_version
+            .entry(version)
+            .or_default()
+            .push(advisory);
     }
 
     let mut out = String::new();
@@ -2459,6 +2476,7 @@ struct PublishResponse {
 #[derive(Debug, Deserialize, Serialize)]
 struct IndexCatalogPackage {
     name: String,
+    is_official: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2941,6 +2959,7 @@ struct SearchParams {
 struct SearchHit {
     name: String,
     latest_version: Option<String>,
+    is_official: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2969,6 +2988,7 @@ async fn search(
     struct Row {
         name: String,
         latest_version: Option<String>,
+        is_official: bool,
         description: Option<String>,
         modules_count: Option<i32>,
     }
@@ -2992,16 +3012,19 @@ async fn search(
             SELECT
                 p.name,
                 p.latest_version,
+                COALESCE(u.handle = $3, false) AS is_official,
                 pv.manifest->>'description' AS description,
                 COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            LEFT JOIN users u ON u.id = p.created_by
             ORDER BY p.name ASC
             LIMIT $1 OFFSET $2
             "#,
         )
         .bind(limit as i64)
         .bind(offset as i64)
+        .bind(OFFICIAL_PUBLISHER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -3037,10 +3060,12 @@ async fn search(
             SELECT
                 p.name,
                 p.latest_version,
+                COALESCE(u.handle = $4, false) AS is_official,
                 pv.manifest->>'description' AS description,
                 COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+            LEFT JOIN users u ON u.id = p.created_by
             WHERE p.name LIKE $1
             ORDER BY p.name ASC
             LIMIT $2 OFFSET $3
@@ -3049,6 +3074,7 @@ async fn search(
         .bind(&like)
         .bind(limit as i64)
         .bind(offset as i64)
+        .bind(OFFICIAL_PUBLISHER_HANDLE)
         .fetch_all(&state.db)
         .await
         {
@@ -3075,6 +3101,7 @@ async fn search(
             .map(|r| SearchHit {
                 name: r.name,
                 latest_version: r.latest_version,
+                is_official: r.is_official,
                 description: r.description,
                 modules_count: r.modules_count,
             })
@@ -3095,6 +3122,7 @@ struct PackageDetailResponse {
     ok: bool,
     name: String,
     latest_version: Option<String>,
+    is_official: bool,
     owners: Vec<String>,
     versions: Vec<PackageVersionInfo>,
 }
@@ -3111,23 +3139,31 @@ async fn package_detail(
     struct PackageRow {
         id: Uuid,
         latest_version: Option<String>,
+        is_official: bool,
     }
 
-    let pkg: Option<PackageRow> =
-        match sqlx::query_as("SELECT id, latest_version FROM packages WHERE name = $1")
-            .bind(&name)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("select package: {err}"),
-                )
-            }
-        };
+    let pkg: Option<PackageRow> = match sqlx::query_as(
+        r#"
+        SELECT p.id, p.latest_version, COALESCE(u.handle = $2, false) AS is_official
+        FROM packages p
+        LEFT JOIN users u ON u.id = p.created_by
+        WHERE p.name = $1
+        "#,
+    )
+    .bind(&name)
+    .bind(OFFICIAL_PUBLISHER_HANDLE)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select package: {err}"),
+            )
+        }
+    };
     let Some(pkg) = pkg else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
@@ -3189,6 +3225,7 @@ async fn package_detail(
         ok: true,
         name,
         latest_version: pkg.latest_version,
+        is_official: pkg.is_official,
         owners,
         versions: versions
             .into_iter()
@@ -3207,6 +3244,7 @@ async fn package_detail(
 struct OwnersResponse {
     ok: bool,
     name: String,
+    is_official: bool,
     owners: Vec<String>,
 }
 
@@ -3218,10 +3256,24 @@ async fn package_owners_list(
         return *resp;
     }
 
-    let pkg_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM packages WHERE name = $1")
-        .bind(&name)
-        .fetch_optional(&state.db)
-        .await
+    #[derive(sqlx::FromRow)]
+    struct PackageOwnershipRow {
+        id: Uuid,
+        is_official: bool,
+    }
+
+    let pkg: Option<PackageOwnershipRow> = match sqlx::query_as(
+        r#"
+        SELECT p.id, COALESCE(u.handle = $2, false) AS is_official
+        FROM packages p
+        LEFT JOIN users u ON u.id = p.created_by
+        WHERE p.name = $1
+        "#,
+    )
+    .bind(&name)
+    .bind(OFFICIAL_PUBLISHER_HANDLE)
+    .fetch_optional(&state.db)
+    .await
     {
         Ok(v) => v,
         Err(err) => {
@@ -3232,14 +3284,14 @@ async fn package_owners_list(
             )
         }
     };
-    let Some(pkg_id) = pkg_id else {
+    let Some(pkg) = pkg else {
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
 
     let owners: Vec<String> = match sqlx::query_scalar(
         "SELECT u.handle FROM package_owners o JOIN users u ON u.id = o.user_id WHERE o.package_id = $1 ORDER BY u.handle ASC",
     )
-    .bind(pkg_id)
+    .bind(pkg.id)
     .fetch_all(&state.db)
     .await
     {
@@ -3256,6 +3308,7 @@ async fn package_owners_list(
     ok_json(OwnersResponse {
         ok: true,
         name,
+        is_official: pkg.is_official,
         owners,
     })
 }
@@ -4309,7 +4362,7 @@ async fn package_advisory_withdraw(
             }
         };
 
-        if let Err(err) = sqlx::query(
+            if let Err(err) = sqlx::query(
             "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version, details) VALUES ($1, $2, 'advisory_withdrawn', $3, $4, $5)",
         )
         .bind(auth.user_id)
@@ -4387,6 +4440,7 @@ struct PackageMetadataResponse {
     ok: bool,
     package: PackageManifest,
     cksum: String,
+    is_official: bool,
 }
 
 async fn package_metadata(
@@ -4405,18 +4459,21 @@ async fn package_metadata(
     struct MetaRow {
         manifest: serde_json::Value,
         cksum: String,
+        is_official: bool,
     }
 
     let row: Option<MetaRow> = match sqlx::query_as(
         r#"
-        SELECT pv.manifest, pv.cksum
+        SELECT pv.manifest, pv.cksum, COALESCE(u.handle = $3, false) AS is_official
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
+        LEFT JOIN users u ON u.id = p.created_by
         WHERE p.name = $1 AND pv.version = $2
         "#,
     )
     .bind(&name)
     .bind(&version)
+    .bind(OFFICIAL_PUBLISHER_HANDLE)
     .fetch_optional(&state.db)
     .await
     {
@@ -4433,7 +4490,11 @@ async fn package_metadata(
         return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
     };
 
-    let MetaRow { manifest, cksum } = row;
+    let MetaRow {
+        manifest,
+        cksum,
+        is_official,
+    } = row;
     let etag = format!("\"{}\"", cksum.as_str());
     if if_none_match(&headers, &etag) {
         return response_not_modified(&etag, CACHE_CONTROL_PACKAGE_METADATA);
@@ -4454,6 +4515,7 @@ async fn package_metadata(
         ok: true,
         package: pkg,
         cksum,
+        is_official,
     });
     set_cache_headers(&mut resp, &etag, CACHE_CONTROL_PACKAGE_METADATA);
     resp

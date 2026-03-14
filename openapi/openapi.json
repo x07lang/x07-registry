@@ -89,10 +89,11 @@
       "SearchHit": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "latest_version"],
+        "required": ["name", "latest_version", "is_official"],
         "properties": {
           "name": { "type": "string" },
-          "latest_version": { "type": ["string", "null"] }
+          "latest_version": { "type": ["string", "null"] },
+          "is_official": { "type": "boolean" }
         }
       },
       "SearchResponse": {
@@ -160,10 +161,11 @@
       "OwnersResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["ok", "name", "owners"],
+        "required": ["ok", "name", "is_official", "owners"],
         "properties": {
           "ok": { "const": true },
           "name": { "type": "string" },
+          "is_official": { "type": "boolean" },
           "owners": { "type": "array", "items": { "type": "string" } }
         }
       },
@@ -307,11 +309,12 @@
       "PackageMetadataResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["ok", "package", "cksum"],
+        "required": ["ok", "package", "cksum", "is_official"],
         "properties": {
           "ok": { "type": "boolean" },
           "package": { "$ref": "#/components/schemas/PackageManifest" },
-          "cksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          "cksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "is_official": { "type": "boolean" }
         }
       },
       "PackageVersionInfo": {
@@ -328,11 +331,12 @@
       "PackageDetailResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["ok", "name", "latest_version", "owners", "versions"],
+        "required": ["ok", "name", "latest_version", "is_official", "owners", "versions"],
         "properties": {
           "ok": { "const": true },
           "name": { "type": "string" },
           "latest_version": { "type": ["string", "null"] },
+          "is_official": { "type": "boolean" },
           "owners": { "type": "array", "items": { "type": "string" } },
           "versions": { "type": "array", "items": { "$ref": "#/components/schemas/PackageVersionInfo" } }
         }

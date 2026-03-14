@@ -128,7 +128,11 @@ async fn create_user_with_token(
     token
 }
 
-async fn create_session_for_user(database_url: &str, schema: &str, handle: &str) -> (String, String) {
+async fn create_session_for_user(
+    database_url: &str,
+    schema: &str,
+    handle: &str,
+) -> (String, String) {
     let pool = connect_test_db(database_url, schema).await;
     let handle = handle.trim().to_ascii_lowercase();
 
@@ -483,7 +487,7 @@ async fn publish_creates_index_and_download() {
     .await;
 
     let token =
-        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+        create_user_with_token(&database_url, &database_schema, "webodik", &["publish"]).await;
 
     let tar = make_tar_with_package("hello", "0.1.0");
     let resp = app
@@ -587,6 +591,7 @@ async fn publish_creates_index_and_download() {
         json["packages"][0]["name"],
         Value::String("hello".to_string())
     );
+    assert_eq!(json["packages"][0]["is_official"], Value::Bool(true));
     assert_eq!(
         json["packages"][0]["latest"],
         Value::String("0.1.0".to_string())
@@ -636,7 +641,7 @@ async fn publish_creates_index_and_download() {
             .expect("cache-control")
             .to_str()
             .expect("cache-control str"),
-        "public, max-age=60"
+        "public, max-age=3600"
     );
     assert_eq!(
         resp.headers()
@@ -650,6 +655,55 @@ async fn publish_creates_index_and_download() {
     assert_eq!(json["ok"], Value::Bool(true));
     assert_eq!(json["cksum"], Value::String(cksum.to_string()));
     assert_eq!(json["package"]["name"], Value::String("hello".to_string()));
+    assert_eq!(json["is_official"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["name"], Value::String("hello".to_string()));
+    assert_eq!(json["is_official"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello/owners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["name"], Value::String("hello".to_string()));
+    assert_eq!(json["is_official"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/search?q=hel")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["packages"][0]["name"],
+        Value::String("hello".to_string())
+    );
+    assert_eq!(json["packages"][0]["is_official"], Value::Bool(true));
 
     let resp = app
         .clone()
@@ -706,6 +760,63 @@ async fn publish_accepts_mixed_worlds_packages() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn openapi_json_has_cache_headers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url,
+        database_schema,
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/openapi/openapi.json")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(CACHE_CONTROL)
+            .expect("cache-control")
+            .to_str()
+            .expect("cache-control str"),
+        "public, max-age=3600"
+    );
+    let etag = resp
+        .headers()
+        .get(ETAG)
+        .expect("etag")
+        .to_str()
+        .expect("etag str")
+        .to_string();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/openapi/openapi.json")
+                .header(IF_NONE_MATCH, etag)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 }
 
 #[tokio::test]
@@ -881,6 +992,21 @@ async fn tokens_owners_and_yank_flow_is_ok() {
         .unwrap()
         .iter()
         .any(|p| p["name"] == "hello"));
+    assert_eq!(json["packages"][0]["is_official"], Value::Bool(false));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/packages/hello/owners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["is_official"], Value::Bool(false));
 
     let resp = app
         .clone()

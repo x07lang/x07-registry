@@ -1875,6 +1875,7 @@ async fn index_file(
             is_official: bool,
             description: Option<String>,
             docs: Option<String>,
+            manifest: Option<serde_json::Value>,
         }
 
         let rows: Vec<CatalogRow> = match sqlx::query_as(
@@ -1889,7 +1890,8 @@ async fn index_file(
                     WHERE o.package_id = p.id AND owner_user.handle = $1
                 ) AS is_official,
                 pv.manifest->>'description' AS description,
-                pv.manifest->>'docs' AS docs
+                pv.manifest->>'docs' AS docs,
+                pv.manifest AS manifest
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
             ORDER BY p.name ASC
@@ -1912,12 +1914,16 @@ async fn index_file(
             schema_version: "x07.index-catalog@0.1.0".to_string(),
             packages: rows
                 .into_iter()
-                .map(|r| IndexCatalogPackage {
-                    name: r.name,
-                    is_official: r.is_official,
-                    latest: r.latest_version,
-                    description: r.description,
-                    docs: r.docs,
+                .map(|r| {
+                    let facets = manifest_facets_from_parts(&r.name, r.manifest.as_ref());
+                    IndexCatalogPackage {
+                        name: r.name,
+                        is_official: r.is_official,
+                        latest: r.latest_version,
+                        description: r.description,
+                        docs: r.docs,
+                        facets,
+                    }
                 })
                 .collect(),
         };
@@ -2468,6 +2474,135 @@ struct PackageManifest {
     meta: Option<serde_json::Value>,
 }
 
+fn push_unique_facet(out: &mut Vec<String>, facet: impl Into<String>) {
+    let facet = facet.into();
+    if !facet.is_empty() && !out.contains(&facet) {
+        out.push(facet);
+    }
+}
+
+fn normalized_meta_values(
+    meta: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    let Some(value) = meta.get(key) else {
+        return Vec::new();
+    };
+    match value {
+        serde_json::Value::String(raw) => {
+            let value = raw.trim().to_ascii_lowercase();
+            if value.is_empty() {
+                Vec::new()
+            } else {
+                vec![value]
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn infer_name_facets(name: &str) -> Vec<String> {
+    let name = name.to_ascii_lowercase();
+    let mut facets = Vec::new();
+    if name.starts_with("ext-db-") || name.starts_with("x07-ext-db-") {
+        push_unique_facet(&mut facets, "capability:database");
+    }
+    if name.starts_with("ext-msg-") || name.starts_with("x07-ext-msg-") {
+        push_unique_facet(&mut facets, "capability:messaging");
+    }
+    if name.starts_with("ext-obj-") || name.starts_with("x07-ext-obj-") {
+        push_unique_facet(&mut facets, "capability:object-store");
+    }
+    for (needle, facet) in [
+        ("postgres", "binding:postgres"),
+        ("redis", "binding:redis"),
+        ("sqlite", "binding:sqlite"),
+        ("amqp", "binding:amqp"),
+        ("s3", "binding:s3"),
+    ] {
+        if name.contains(needle) {
+            push_unique_facet(&mut facets, facet);
+        }
+    }
+    facets
+}
+
+fn manifest_facets_from_parts(name: &str, meta: Option<&serde_json::Value>) -> Vec<String> {
+    let mut facets = infer_name_facets(name);
+    let Some(meta) = meta.and_then(serde_json::Value::as_object) else {
+        facets.sort();
+        facets.dedup();
+        return facets;
+    };
+    for facet in normalized_meta_values(meta, "facets") {
+        push_unique_facet(&mut facets, facet);
+    }
+    for (key, prefix) in [
+        ("archetype", "archetype"),
+        ("archetypes", "archetype"),
+        ("binding", "binding"),
+        ("bindings", "binding"),
+        ("runtime", "runtime"),
+        ("runtimes", "runtime"),
+        ("trust_profile", "trust"),
+        ("trust_profiles", "trust"),
+        ("capability", "capability"),
+        ("capabilities", "capability"),
+    ] {
+        for value in normalized_meta_values(meta, key) {
+            push_unique_facet(&mut facets, format!("{prefix}:{value}"));
+        }
+    }
+    facets.sort();
+    facets.dedup();
+    facets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manifest_facets_from_parts;
+    use serde_json::json;
+
+    #[test]
+    fn infers_facets_for_prefixed_x07_package_names() {
+        let facets = manifest_facets_from_parts("x07-ext-obj-s3", None);
+        assert_eq!(
+            facets,
+            vec!["binding:s3".to_string(), "capability:object-store".to_string()]
+        );
+    }
+
+    #[test]
+    fn merges_and_normalizes_manifest_meta_facets() {
+        let meta = json!({
+            "facets": ["  curated  ", "binding:s3"],
+            "bindings": [" Postgres ", "s3"],
+            "runtimes": [" Native-Http "],
+            "trust_profile": " Verified ",
+            "capabilities": ["Object-Store", "database"],
+        });
+        let facets = manifest_facets_from_parts("x07-ext-db-postgres-s3", Some(&meta));
+        assert_eq!(
+            facets,
+            vec![
+                "binding:postgres".to_string(),
+                "binding:s3".to_string(),
+                "capability:database".to_string(),
+                "capability:object-store".to_string(),
+                "curated".to_string(),
+                "runtime:native-http".to_string(),
+                "trust:verified".to_string(),
+            ]
+        );
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PublishResponse {
     ok: bool,
@@ -2487,6 +2622,8 @@ struct IndexCatalogPackage {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     docs: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    facets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2968,6 +3105,8 @@ struct SearchHit {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modules_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    facets: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2995,6 +3134,7 @@ async fn search(
         is_official: bool,
         description: Option<String>,
         modules_count: Option<i32>,
+        manifest: Option<serde_json::Value>,
     }
 
     let (total, rows): (i64, Vec<Row>) = if q.is_empty() {
@@ -3023,7 +3163,8 @@ async fn search(
                     WHERE o.package_id = p.id AND owner_user.handle = $3
                 ) AS is_official,
                 pv.manifest->>'description' AS description,
-                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
+                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count,
+                pv.manifest AS manifest
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
             ORDER BY p.name ASC
@@ -3075,7 +3216,8 @@ async fn search(
                     WHERE o.package_id = p.id AND owner_user.handle = $4
                 ) AS is_official,
                 pv.manifest->>'description' AS description,
-                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count
+                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count,
+                pv.manifest AS manifest
             FROM packages p
             LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
             WHERE p.name LIKE $1
@@ -3110,12 +3252,16 @@ async fn search(
         total,
         packages: rows
             .into_iter()
-            .map(|r| SearchHit {
-                name: r.name,
-                latest_version: r.latest_version,
-                is_official: r.is_official,
-                description: r.description,
-                modules_count: r.modules_count,
+            .map(|r| {
+                let facets = manifest_facets_from_parts(&r.name, r.manifest.as_ref());
+                SearchHit {
+                    name: r.name,
+                    latest_version: r.latest_version,
+                    is_official: r.is_official,
+                    description: r.description,
+                    modules_count: r.modules_count,
+                    facets,
+                }
             })
             .collect(),
     })
@@ -3137,6 +3283,8 @@ struct PackageDetailResponse {
     is_official: bool,
     owners: Vec<String>,
     versions: Vec<PackageVersionInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    facets: Vec<String>,
 }
 
 async fn package_detail(
@@ -3152,6 +3300,7 @@ async fn package_detail(
         id: Uuid,
         latest_version: Option<String>,
         is_official: bool,
+        manifest: Option<serde_json::Value>,
     }
 
     let pkg: Option<PackageRow> = match sqlx::query_as(
@@ -3164,8 +3313,10 @@ async fn package_detail(
                 FROM package_owners o
                 JOIN users owner_user ON owner_user.id = o.user_id
                 WHERE o.package_id = p.id AND owner_user.handle = $2
-            ) AS is_official
+            ) AS is_official,
+            pv.manifest AS manifest
         FROM packages p
+        LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
         WHERE p.name = $1
         "#,
     )
@@ -3240,6 +3391,7 @@ async fn package_detail(
         }
     });
 
+    let facets = manifest_facets_from_parts(&name, pkg.manifest.as_ref());
     ok_json(PackageDetailResponse {
         ok: true,
         name,
@@ -3256,6 +3408,7 @@ async fn package_detail(
                 published_at: v.published_at,
             })
             .collect(),
+        facets,
     })
 }
 
@@ -4466,6 +4619,8 @@ struct PackageMetadataResponse {
     package: PackageManifest,
     cksum: String,
     is_official: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    facets: Vec<String>,
 }
 
 async fn package_metadata(
@@ -4545,6 +4700,7 @@ async fn package_metadata(
 
     let mut resp = ok_json(PackageMetadataResponse {
         ok: true,
+        facets: manifest_facets_from_parts(&pkg.name, pkg.meta.as_ref()),
         package: pkg,
         cksum,
         is_official,

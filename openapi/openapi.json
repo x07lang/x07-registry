@@ -30,6 +30,31 @@
           "verified-namespaces": { "type": "array", "items": { "type": "string" } }
         }
       },
+      "IndexCatalogPackage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "is_official"],
+        "properties": {
+          "name": { "type": "string" },
+          "is_official": { "type": "boolean" },
+          "latest": { "type": ["string", "null"] },
+          "description": { "type": ["string", "null"] },
+          "docs": { "type": ["string", "null"] },
+          "facets": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "IndexCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "packages"],
+        "properties": {
+          "schema_version": { "const": "x07.index-catalog@0.1.0" },
+          "packages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/IndexCatalogPackage" }
+          }
+        }
+      },
       "TokenCheckResponse": {
         "type": "object",
         "additionalProperties": false,
@@ -93,7 +118,10 @@
         "properties": {
           "name": { "type": "string" },
           "latest_version": { "type": ["string", "null"] },
-          "is_official": { "type": "boolean" }
+          "is_official": { "type": "boolean" },
+          "description": { "type": ["string", "null"] },
+          "modules_count": { "type": ["integer", "null"] },
+          "facets": { "type": "array", "items": { "type": "string" } }
         }
       },
       "SearchResponse": {
@@ -314,7 +342,8 @@
           "ok": { "type": "boolean" },
           "package": { "$ref": "#/components/schemas/PackageManifest" },
           "cksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-          "is_official": { "type": "boolean" }
+          "is_official": { "type": "boolean" },
+          "facets": { "type": "array", "items": { "type": "string" } }
         }
       },
       "PackageVersionInfo": {
@@ -338,7 +367,8 @@
           "latest_version": { "type": ["string", "null"] },
           "is_official": { "type": "boolean" },
           "owners": { "type": "array", "items": { "type": "string" } },
-          "versions": { "type": "array", "items": { "$ref": "#/components/schemas/PackageVersionInfo" } }
+          "versions": { "type": "array", "items": { "$ref": "#/components/schemas/PackageVersionInfo" } },
+          "facets": { "type": "array", "items": { "type": "string" } }
         }
       }
     }
@@ -366,6 +396,20 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/IndexConfig" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/index/catalog.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Catalog index",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IndexCatalog" }
               }
             }
           }

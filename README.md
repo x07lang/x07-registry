@@ -40,6 +40,7 @@ Use the registry when you need to:
 
 - publish a package for other X07 projects to consume
 - browse package versions and metadata
+- filter or classify package lines by additive archetype, runtime, binding, trust, and capability facets
 - serve the sparse index used by tooling
 - support the `x07 pkg` workflow with a real API backend
 
@@ -89,6 +90,7 @@ Useful end-user docs:
 - `GET /index/config.json` → sparse index config with API and download bases
 - `GET /index/catalog.json` → package catalog JSON
 - `GET /index/<prefix>/<name>` → package index entry in NDJSON form
+- `GET /v1/search` and package metadata/detail responses expose additive `facets` derived from package manifest metadata
 
 Index endpoints include `ETag` and `Cache-Control` and support `If-None-Match` revalidation with `304 Not Modified`.
 

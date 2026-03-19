@@ -763,6 +763,134 @@ async fn publish_accepts_mixed_worlds_packages() {
 }
 
 #[tokio::test]
+async fn facets_are_exposed_in_catalog_search_and_package_views() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+    let module = br#"{"decls":[{"kind":"export","names":["svc.runtime.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"svc.runtime.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"svc.runtime","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let tar = make_tar_with_package_with_modules(
+        "ext-db-postgres",
+        "0.1.0",
+        Some(serde_json::json!({
+            "archetypes": ["api-cell"],
+            "runtimes": ["native-http"],
+            "bindings": ["postgres", "otlp"],
+            "trust_profile": "standard"
+        })),
+        vec![("svc.runtime", module)],
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let catalog = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/index/catalog.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let catalog_facets = catalog["packages"][0]["facets"]
+        .as_array()
+        .expect("catalog facets");
+    assert!(catalog_facets
+        .iter()
+        .any(|facet| facet == "binding:postgres"));
+    assert!(catalog_facets
+        .iter()
+        .any(|facet| facet == "runtime:native-http"));
+    assert!(catalog_facets.iter().any(|facet| facet == "trust:standard"));
+
+    let search = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search?q=postgres")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let search_facets = search["packages"][0]["facets"]
+        .as_array()
+        .expect("search facets");
+    assert!(search_facets
+        .iter()
+        .any(|facet| facet == "capability:database"));
+    assert!(search_facets.iter().any(|facet| facet == "binding:otlp"));
+
+    let metadata = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/packages/ext-db-postgres/0.1.0/metadata")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let metadata_facets = metadata["facets"].as_array().expect("metadata facets");
+    assert!(metadata_facets
+        .iter()
+        .any(|facet| facet == "archetype:api-cell"));
+
+    let detail = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/packages/ext-db-postgres")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let detail_facets = detail["facets"].as_array().expect("detail facets");
+    assert!(detail_facets
+        .iter()
+        .any(|facet| facet == "binding:postgres"));
+    assert!(detail_facets
+        .iter()
+        .any(|facet| facet == "runtime:native-http"));
+}
+
+#[tokio::test]
 async fn openapi_json_has_cache_headers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (database_url, database_schema) = create_test_schema().await;

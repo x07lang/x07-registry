@@ -2,34 +2,16 @@ use axum::http::header::{LOCATION, SET_COOKIE};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
 use tower::ServiceExt;
-use uuid::Uuid;
+
+mod support;
+
+use support::create_test_schema;
 
 async fn read_body_json(body: axum::body::Body) -> Value {
     let bytes = body.collect().await.expect("collect body").to_bytes();
     serde_json::from_slice(&bytes).expect("parse json body")
-}
-
-async fn create_test_schema() -> (String, String) {
-    let database_url = std::env::var("X07_REGISTRY_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgres://x07:x07@127.0.0.1:55432/x07_registry".to_string());
-    let schema = format!("test_{}", Uuid::new_v4().simple());
-
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(3))
-        .connect(&database_url)
-        .await
-        .expect("connect postgres");
-    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&pool)
-        .await
-        .expect("create schema");
-
-    (database_url, schema)
 }
 
 fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {

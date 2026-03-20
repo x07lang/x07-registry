@@ -51,6 +51,16 @@ Prereqs:
 - Rust toolchain
 - Postgres, or the shared workspace `dev-stack/`
 
+Before pushing, run the repo-local gate:
+
+```sh
+bash scripts/ci/check_local.sh
+```
+
+That script provisions the Postgres and MinIO services that GitHub Actions expects.
+If you run `cargo test` directly, point `X07_REGISTRY_TEST_DATABASE_URL` at a live Postgres
+instance. The test default is `postgres://postgres:postgres@127.0.0.1:55432/postgres`.
+
 Run the API from the repo root:
 
 ```sh

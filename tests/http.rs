@@ -891,6 +891,122 @@ async fn facets_are_exposed_in_catalog_search_and_package_views() {
 }
 
 #[tokio::test]
+async fn archetypes_endpoint_groups_latest_packages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+    let module = br#"{"decls":[{"kind":"export","names":["svc.runtime.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"svc.runtime.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"svc.runtime","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+
+    for (name, version, archetypes) in [
+        ("ext-service-api", "0.1.0", serde_json::json!(["api-cell"])),
+        (
+            "ext-service-worker",
+            "0.1.0",
+            serde_json::json!(["event-consumer", "api-cell"]),
+        ),
+        (
+            "ext-service-job",
+            "0.1.0",
+            serde_json::json!(["scheduled-job"]),
+        ),
+    ] {
+        let tar = make_tar_with_package_with_modules(
+            name,
+            version,
+            Some(serde_json::json!({
+                "archetypes": archetypes,
+                "runtimes": ["native-http"]
+            })),
+            vec![("svc.runtime", module.clone())],
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/packages/publish")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(tar))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let archetypes = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/archetypes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(archetypes["ok"], true);
+    assert_eq!(archetypes["total"], 3);
+    let api_cell = archetypes["archetypes"]
+        .as_array()
+        .expect("archetype list")
+        .iter()
+        .find(|item| item["archetype"] == "api-cell")
+        .expect("api-cell entry");
+    assert_eq!(api_cell["package_count"], 2);
+
+    let filtered = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/archetypes?q=scheduled")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["archetypes"][0]["archetype"], "scheduled-job");
+
+    let detail = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/archetypes/api-cell")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(detail["archetype"], "api-cell");
+    assert_eq!(detail["package_count"], 2);
+    assert!(detail["packages"]
+        .as_array()
+        .expect("archetype packages")
+        .iter()
+        .any(|pkg| pkg["name"] == "ext-service-api"));
+}
+
+#[tokio::test]
 async fn openapi_json_has_cache_headers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (database_url, database_schema) = create_test_schema().await;

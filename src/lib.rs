@@ -1915,7 +1915,10 @@ async fn index_file(
             packages: rows
                 .into_iter()
                 .map(|r| {
-                    let facets = manifest_facets_from_parts(&r.name, r.manifest.as_ref());
+                    let facets = manifest_facets_from_parts(
+                        &r.name,
+                        manifest_meta_value(r.manifest.as_ref()),
+                    );
                     IndexCatalogPackage {
                         name: r.name,
                         is_official: r.is_official,
@@ -2564,6 +2567,12 @@ fn manifest_facets_from_parts(name: &str, meta: Option<&serde_json::Value>) -> V
     facets
 }
 
+fn manifest_meta_value(manifest: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    manifest
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.get("meta"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::manifest_facets_from_parts;
@@ -2574,7 +2583,10 @@ mod tests {
         let facets = manifest_facets_from_parts("x07-ext-obj-s3", None);
         assert_eq!(
             facets,
-            vec!["binding:s3".to_string(), "capability:object-store".to_string()]
+            vec![
+                "binding:s3".to_string(),
+                "capability:object-store".to_string()
+            ]
         );
     }
 
@@ -3119,6 +3131,98 @@ struct SearchResponse {
     packages: Vec<SearchHit>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArchetypeParams {
+    #[serde(default)]
+    q: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchetypePackageHit {
+    name: String,
+    latest_version: Option<String>,
+    is_official: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchetypeHit {
+    archetype: String,
+    package_count: usize,
+    packages: Vec<ArchetypePackageHit>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchetypeListResponse {
+    ok: bool,
+    q: String,
+    limit: u32,
+    offset: u32,
+    total: usize,
+    archetypes: Vec<ArchetypeHit>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchetypeDetailResponse {
+    ok: bool,
+    archetype: String,
+    package_count: usize,
+    packages: Vec<ArchetypePackageHit>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ArchetypePackageRow {
+    name: String,
+    latest_version: Option<String>,
+    is_official: bool,
+    description: Option<String>,
+    manifest: Option<serde_json::Value>,
+}
+
+async fn latest_package_inventory(
+    state: &Arc<AppState>,
+) -> Result<Vec<ArchetypePackageRow>, Response> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            p.name,
+            p.latest_version,
+            EXISTS(
+                SELECT 1
+                FROM package_owners o
+                JOIN users owner_user ON owner_user.id = o.user_id
+                WHERE o.package_id = p.id AND owner_user.handle = $1
+            ) AS is_official,
+            pv.manifest->>'description' AS description,
+            pv.manifest AS manifest
+        FROM packages p
+        LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+        ORDER BY p.name ASC
+        "#,
+    )
+    .bind(OFFICIAL_OWNER_HANDLE)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("select archetypes: {err}"),
+        )
+        .into_response()
+    })
+}
+
+fn manifest_archetypes_from_parts(name: &str, meta: Option<&serde_json::Value>) -> Vec<String> {
+    manifest_facets_from_parts(name, meta)
+        .into_iter()
+        .filter_map(|facet| facet.strip_prefix("archetype:").map(ToOwned::to_owned))
+        .collect()
+}
+
 async fn search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -3253,7 +3357,8 @@ async fn search(
         packages: rows
             .into_iter()
             .map(|r| {
-                let facets = manifest_facets_from_parts(&r.name, r.manifest.as_ref());
+                let facets =
+                    manifest_facets_from_parts(&r.name, manifest_meta_value(r.manifest.as_ref()));
                 SearchHit {
                     name: r.name,
                     latest_version: r.latest_version,
@@ -3264,6 +3369,119 @@ async fn search(
                 }
             })
             .collect(),
+    })
+}
+
+async fn archetypes_list(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ArchetypeParams>,
+) -> Response {
+    let q = params.q.trim().to_ascii_lowercase();
+    let limit = params.limit.unwrap_or(20).min(100);
+    let offset = params.offset.unwrap_or(0);
+    let rows = match latest_package_inventory(&state).await {
+        Ok(rows) => rows,
+        Err(resp) => return resp,
+    };
+
+    let mut grouped: HashMap<String, Vec<ArchetypePackageHit>> = HashMap::new();
+    for row in rows {
+        let package = ArchetypePackageHit {
+            name: row.name.clone(),
+            latest_version: row.latest_version.clone(),
+            is_official: row.is_official,
+            description: row.description.clone(),
+        };
+        let package_text = format!(
+            "{} {}",
+            row.name.to_ascii_lowercase(),
+            row.description
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        );
+        for archetype in
+            manifest_archetypes_from_parts(&row.name, manifest_meta_value(row.manifest.as_ref()))
+        {
+            if !q.is_empty() && !archetype.contains(&q) && !package_text.contains(&q) {
+                continue;
+            }
+            grouped.entry(archetype).or_default().push(package.clone());
+        }
+    }
+
+    let mut archetypes = grouped
+        .into_iter()
+        .map(|(archetype, mut packages)| {
+            packages.sort_by(|left, right| left.name.cmp(&right.name));
+            ArchetypeHit {
+                package_count: packages.len(),
+                archetype,
+                packages,
+            }
+        })
+        .collect::<Vec<_>>();
+    archetypes.sort_by(|left, right| left.archetype.cmp(&right.archetype));
+    let total = archetypes.len();
+    let archetypes = archetypes
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+
+    ok_json(ArchetypeListResponse {
+        ok: true,
+        q,
+        limit,
+        offset,
+        total,
+        archetypes,
+    })
+}
+
+async fn archetype_detail(
+    State(state): State<Arc<AppState>>,
+    AxPath(name): AxPath<String>,
+) -> Response {
+    let archetype = name.trim().to_ascii_lowercase();
+    if archetype.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_ARCHETYPE",
+            "archetype name is required",
+        );
+    }
+    let rows = match latest_package_inventory(&state).await {
+        Ok(rows) => rows,
+        Err(resp) => return resp,
+    };
+    let mut packages = rows
+        .into_iter()
+        .filter(|row| {
+            manifest_archetypes_from_parts(&row.name, manifest_meta_value(row.manifest.as_ref()))
+                .into_iter()
+                .any(|candidate| candidate == archetype)
+        })
+        .map(|row| ArchetypePackageHit {
+            name: row.name,
+            latest_version: row.latest_version,
+            is_official: row.is_official,
+            description: row.description,
+        })
+        .collect::<Vec<_>>();
+    if packages.is_empty() {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "X07REG_NOT_FOUND",
+            "archetype not found",
+        );
+    }
+    packages.sort_by(|left, right| left.name.cmp(&right.name));
+    ok_json(ArchetypeDetailResponse {
+        ok: true,
+        archetype,
+        package_count: packages.len(),
+        packages,
     })
 }
 
@@ -3391,7 +3609,7 @@ async fn package_detail(
         }
     });
 
-    let facets = manifest_facets_from_parts(&name, pkg.manifest.as_ref());
+    let facets = manifest_facets_from_parts(&name, manifest_meta_value(pkg.manifest.as_ref()));
     ok_json(PackageDetailResponse {
         ok: true,
         name,
@@ -4802,6 +5020,8 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .route("/v1/auth/session", get(auth_session))
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/account", get(account))
+        .route("/v1/archetypes", get(archetypes_list))
+        .route("/v1/archetypes/{name}", get(archetype_detail))
         .route("/v1/search", get(search))
         .route("/v1/tokens", get(tokens_list).post(token_create))
         .route("/v1/tokens/{token_id}/revoke", post(token_revoke))

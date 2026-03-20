@@ -90,6 +90,8 @@ Useful end-user docs:
 - `GET /index/config.json` → sparse index config with API and download bases
 - `GET /index/catalog.json` → package catalog JSON
 - `GET /index/<prefix>/<name>` → package index entry in NDJSON form
+- `GET /v1/archetypes` → archetype index derived from package metadata
+- `GET /v1/archetypes/<name>` → packages for one archetype
 - `GET /v1/search` and package metadata/detail responses expose additive `facets` derived from package manifest metadata
 
 Index endpoints include `ETag` and `Cache-Control` and support `If-None-Match` revalidation with `304 Not Modified`.

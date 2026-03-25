@@ -143,6 +143,8 @@ async fn github_oauth_onboarding_can_create_token_and_publish() {
             api_base: github_base.clone(),
         }),
         admin_github_user_ids: HashSet::new(),
+        scale_evidence_allowed_hosts: vec!["example.com".to_string()],
+        scale_evidence_allowed_s3_buckets: Vec::new(),
         session_cookie_domain: None,
         session_cookie_secure: false,
         session_ttl_seconds: 60 * 60,

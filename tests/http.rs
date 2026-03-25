@@ -147,6 +147,8 @@ fn base_config(
         verified_namespaces: Vec::new(),
         github_oauth: None,
         admin_github_user_ids: HashSet::new(),
+        scale_evidence_allowed_hosts: vec!["example.com".to_string()],
+        scale_evidence_allowed_s3_buckets: Vec::new(),
         session_cookie_domain: None,
         session_cookie_secure: false,
         session_ttl_seconds: 60 * 60,
@@ -300,6 +302,223 @@ async fn healthz_is_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn scale_metadata_is_persisted_and_filterable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let module = br#"{"decls":[{"kind":"export","names":["svc.runtime.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"svc.runtime.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"svc.runtime","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let tar = make_tar_with_package_with_modules(
+        "x07-workload-pack-demo",
+        "0.1.0",
+        Some(serde_json::json!({
+            "scale_classes_supported": ["replicated-http", "partitioned-consumer"],
+            "scale_tested": true,
+            "scale_test_evidence_ref": "https://example.com/evidence.json",
+        })),
+        vec![("svc.runtime", module)],
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let metadata = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/packages/x07-workload-pack-demo/0.1.0/metadata")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(metadata["scale_tested"], Value::Bool(true));
+    assert_eq!(
+        metadata["scale_test_evidence_ref"],
+        Value::String("https://example.com/evidence.json".to_string())
+    );
+    assert_eq!(
+        metadata["scale_classes_supported"],
+        serde_json::json!(["partitioned-consumer", "replicated-http"])
+    );
+
+    let search = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search?scale_tested=true&q=workload")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(search["total"].as_i64(), Some(1));
+    assert_eq!(
+        search["packages"][0]["name"],
+        Value::String("x07-workload-pack-demo".to_string())
+    );
+}
+
+#[tokio::test]
+async fn scale_evidence_endpoint_enforces_allowlist_and_persists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let module = br#"{"decls":[{"kind":"export","names":["svc.runtime.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"svc.runtime.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"svc.runtime","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let tar = make_tar_with_package_with_modules(
+        "x07-workload-pack-evidence",
+        "0.1.0",
+        Some(serde_json::json!({
+            "scale_classes_supported": ["replicated-http"],
+        })),
+        vec![("svc.runtime", module)],
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packs/x07-workload-pack-evidence/versions/0.1.0/scale-evidence")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"evidence_ref":"https://evil.com/evidence.json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packs/x07-workload-pack-evidence/versions/0.1.0/scale-evidence")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"evidence_ref":"https://example.com/evidence.json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["scale_tested"], Value::Bool(true));
+    assert_eq!(
+        json["scale_test_evidence_ref"],
+        Value::String("https://example.com/evidence.json".to_string())
+    );
+
+    let metadata = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/packages/x07-workload-pack-evidence/0.1.0/metadata")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(metadata["scale_tested"], Value::Bool(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packs/x07-workload-pack-evidence/versions/0.1.0/scale-evidence")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"evidence_ref":"https://example.com/evidence.json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packs/x07-workload-pack-evidence/versions/0.1.0/scale-evidence")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"evidence_ref":"https://example.com/other.json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

@@ -96,6 +96,8 @@ fn base_config(
         verified_namespaces: Vec::new(),
         github_oauth: None,
         admin_github_user_ids: HashSet::new(),
+        scale_evidence_allowed_hosts: vec!["example.com".to_string()],
+        scale_evidence_allowed_s3_buckets: Vec::new(),
         session_cookie_domain: None,
         session_cookie_secure: false,
         session_ttl_seconds: 60 * 60,

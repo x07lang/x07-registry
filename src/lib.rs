@@ -135,6 +135,8 @@ pub struct RegistryConfig {
     pub verified_namespaces: Vec<String>,
     pub github_oauth: Option<GithubOAuthConfig>,
     pub admin_github_user_ids: HashSet<i64>,
+    pub scale_evidence_allowed_hosts: Vec<String>,
+    pub scale_evidence_allowed_s3_buckets: Vec<String>,
     pub session_cookie_domain: Option<String>,
     pub session_cookie_secure: bool,
     pub session_ttl_seconds: i64,
@@ -225,6 +227,26 @@ impl RegistryConfig {
         verified_namespaces.sort();
         verified_namespaces.dedup();
 
+        let mut scale_evidence_allowed_hosts =
+            std::env::var("X07_REGISTRY_SCALE_EVIDENCE_ALLOWED_HOSTS")
+                .unwrap_or_else(|_| "x07.io".to_string())
+                .split(',')
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<String>>();
+        scale_evidence_allowed_hosts.sort();
+        scale_evidence_allowed_hosts.dedup();
+
+        let mut scale_evidence_allowed_s3_buckets =
+            std::env::var("X07_REGISTRY_SCALE_EVIDENCE_ALLOWED_S3_BUCKETS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<String>>();
+        scale_evidence_allowed_s3_buckets.sort();
+        scale_evidence_allowed_s3_buckets.dedup();
+
         let storage = match std::env::var("X07_REGISTRY_STORAGE")
             .unwrap_or_else(|_| "fs".to_string())
             .as_str()
@@ -275,6 +297,8 @@ impl RegistryConfig {
             verified_namespaces,
             github_oauth,
             admin_github_user_ids,
+            scale_evidence_allowed_hosts,
+            scale_evidence_allowed_s3_buckets,
             session_cookie_domain,
             session_cookie_secure,
             session_ttl_seconds,
@@ -2573,6 +2597,229 @@ fn manifest_meta_value(manifest: Option<&serde_json::Value>) -> Option<&serde_js
         .and_then(|object| object.get("meta"))
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone)]
+struct ScaleMetadata {
+    scale_classes_supported: Vec<String>,
+    scale_tested: bool,
+    scale_test_evidence_ref: Option<String>,
+}
+
+fn parse_scale_metadata(meta: Option<&serde_json::Value>, cfg: &RegistryConfig) -> ApiResult<ScaleMetadata> {
+    let Some(meta) = meta.and_then(serde_json::Value::as_object) else {
+        return Ok(ScaleMetadata {
+            scale_classes_supported: Vec::new(),
+            scale_tested: false,
+            scale_test_evidence_ref: None,
+        });
+    };
+
+    let scale_classes_supported = match meta.get("scale_classes_supported") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(raw)) => vec![raw.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_META",
+                    "meta.scale_classes_supported must be a string array",
+                )
+            })?,
+        _ => {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_INVALID_SCALE_META",
+                "meta.scale_classes_supported must be a string array",
+            ))
+        }
+    };
+
+    let mut scale_classes_supported = scale_classes_supported
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let valid = value.len() <= 64
+                && value
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, b)| match b {
+                        b'a'..=b'z' => true,
+                        b'0'..=b'9' | b'-' => idx > 0,
+                        _ => false,
+                    });
+            if !valid {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_META",
+                    format!("invalid scale class: {value:?}"),
+                ));
+            }
+            Ok(value)
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    scale_classes_supported.sort();
+    scale_classes_supported.dedup();
+
+    let scale_tested = match meta.get("scale_tested") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        _ => {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_INVALID_SCALE_META",
+                "meta.scale_tested must be a boolean",
+            ))
+        }
+    };
+
+    let scale_test_evidence_ref = match meta.get("scale_test_evidence_ref") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(validate_scale_evidence_ref(cfg, trimmed)?)
+            }
+        }
+        _ => {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_INVALID_SCALE_META",
+                "meta.scale_test_evidence_ref must be a string",
+            ))
+        }
+    };
+
+    Ok(ScaleMetadata {
+        scale_classes_supported,
+        scale_tested: scale_tested || scale_test_evidence_ref.is_some(),
+        scale_test_evidence_ref,
+    })
+}
+
+fn validate_scale_evidence_ref(cfg: &RegistryConfig, raw: &str) -> ApiResult<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_SCALE_EVIDENCE",
+            "evidence_ref must be non-empty",
+        ));
+    }
+    if raw.len() > 2048 {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_SCALE_EVIDENCE",
+            "evidence_ref too long",
+        ));
+    }
+
+    let url = reqwest::Url::parse(raw).map_err(|err| {
+        boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_SCALE_EVIDENCE",
+            format!("invalid evidence_ref url: {err}"),
+        )
+    })?;
+
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_SCALE_EVIDENCE",
+            "evidence_ref must not include query or fragment",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(boxed_json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_INVALID_SCALE_EVIDENCE",
+            "evidence_ref must not include user info",
+        ));
+    }
+
+    match url.scheme() {
+        "https" => {
+            if let Some(port) = url.port() {
+                if port != 443 {
+                    return Err(boxed_json_error(
+                        StatusCode::BAD_REQUEST,
+                        "X07REG_INVALID_SCALE_EVIDENCE",
+                        "evidence_ref must use default https port",
+                    ));
+                }
+            }
+            let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+            if host.is_empty() {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_EVIDENCE",
+                    "evidence_ref must include host",
+                ));
+            }
+            if host == "localhost"
+                || host.ends_with(".localhost")
+                || host.parse::<std::net::IpAddr>().is_ok()
+            {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_EVIDENCE",
+                    "evidence_ref host must be a public domain",
+                ));
+            }
+            let allowed = cfg.scale_evidence_allowed_hosts.iter().any(|allowed| {
+                host == *allowed || host.ends_with(&format!(".{allowed}"))
+            });
+            if !allowed {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_EVIDENCE",
+                    "evidence_ref host not allowed",
+                ));
+            }
+        }
+        "s3" => {
+            let bucket = url.host_str().unwrap_or("");
+            if bucket.is_empty() || url.path().trim_matches('/').is_empty() {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_EVIDENCE",
+                    "s3 evidence_ref must include bucket and key",
+                ));
+            }
+            if !cfg.scale_evidence_allowed_s3_buckets.is_empty()
+                && !cfg
+                    .scale_evidence_allowed_s3_buckets
+                    .iter()
+                    .any(|allowed| allowed == bucket)
+            {
+                return Err(boxed_json_error(
+                    StatusCode::BAD_REQUEST,
+                    "X07REG_INVALID_SCALE_EVIDENCE",
+                    "s3 evidence_ref bucket not allowed",
+                ));
+            }
+        }
+        _ => {
+            return Err(boxed_json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_INVALID_SCALE_EVIDENCE",
+                "unsupported evidence_ref scheme",
+            ))
+        }
+    }
+
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::manifest_facets_from_parts;
@@ -2923,14 +3170,21 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             );
         }
     };
+    let scale_meta = match parse_scale_metadata(manifest.meta.as_ref(), &state.cfg) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
     if let Err(err) = sqlx::query(
-        "INSERT INTO package_versions(package_id, version, cksum, yanked, manifest, published_by) VALUES ($1, $2, $3, false, $4, $5)",
+        "INSERT INTO package_versions(package_id, version, cksum, yanked, manifest, published_by, scale_classes_supported, scale_tested, scale_test_evidence_ref) VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8)",
     )
     .bind(package_id)
     .bind(pkg_version)
     .bind(&cksum)
     .bind(manifest_json)
     .bind(auth.user_id)
+    .bind(scale_meta.scale_classes_supported)
+    .bind(scale_meta.scale_tested)
+    .bind(scale_meta.scale_test_evidence_ref)
     .execute(&mut *tx)
     .await
     {
@@ -3106,6 +3360,7 @@ struct SearchParams {
     q: String,
     limit: Option<u32>,
     offset: Option<u32>,
+    scale_tested: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3230,6 +3485,7 @@ async fn search(
     let q = params.q.trim().to_string();
     let limit = params.limit.unwrap_or(20).min(100);
     let offset = params.offset.unwrap_or(0);
+    let scale_tested = params.scale_tested.unwrap_or(false);
 
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -3241,111 +3497,79 @@ async fn search(
         manifest: Option<serde_json::Value>,
     }
 
-    let (total, rows): (i64, Vec<Row>) = if q.is_empty() {
-        let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM packages")
-            .fetch_one(&state.db)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("count packages: {err}"),
-                )
-            }
-        };
-        let rows: Vec<Row> = match sqlx::query_as(
-            r#"
-            SELECT
-                p.name,
-                p.latest_version,
-                EXISTS(
-                    SELECT 1
-                    FROM package_owners o
-                    JOIN users owner_user ON owner_user.id = o.user_id
-                    WHERE o.package_id = p.id AND owner_user.handle = $3
-                ) AS is_official,
-                pv.manifest->>'description' AS description,
-                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count,
-                pv.manifest AS manifest
-            FROM packages p
-            LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
-            ORDER BY p.name ASC
-            LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .bind(OFFICIAL_OWNER_HANDLE)
-        .fetch_all(&state.db)
+    let like = (!q.is_empty()).then(|| format!("%{q}%"));
+
+    let mut count_builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT COUNT(*) FROM packages p LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version WHERE 1=1",
+    );
+    if let Some(like) = &like {
+        count_builder.push(" AND p.name LIKE ");
+        count_builder.push_bind(like);
+    }
+    if scale_tested {
+        count_builder.push(" AND pv.scale_tested = true");
+    }
+
+    let total: i64 = match count_builder
+        .build_query_scalar::<i64>()
+        .fetch_one(&state.db)
         .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("select packages: {err}"),
-                )
-            }
-        };
-        (total, rows)
-    } else {
-        let like = format!("%{q}%");
-        let total: i64 =
-            match sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE name LIKE $1")
-                .bind(&like)
-                .fetch_one(&state.db)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    return json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "X07REG_DB",
-                        format!("count search: {err}"),
-                    )
-                }
-            };
-        let rows: Vec<Row> = match sqlx::query_as(
-            r#"
-            SELECT
-                p.name,
-                p.latest_version,
-                EXISTS(
-                    SELECT 1
-                    FROM package_owners o
-                    JOIN users owner_user ON owner_user.id = o.user_id
-                    WHERE o.package_id = p.id AND owner_user.handle = $4
-                ) AS is_official,
-                pv.manifest->>'description' AS description,
-                COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count,
-                pv.manifest AS manifest
-            FROM packages p
-            LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
-            WHERE p.name LIKE $1
-            ORDER BY p.name ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(&like)
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .bind(OFFICIAL_OWNER_HANDLE)
-        .fetch_all(&state.db)
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "X07REG_DB",
-                    format!("select search: {err}"),
-                )
-            }
-        };
-        (total, rows)
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("count search: {err}"),
+            )
+        }
+    };
+
+    let mut rows_builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        r#"
+        SELECT
+            p.name,
+            p.latest_version,
+            EXISTS(
+                SELECT 1
+                FROM package_owners o
+                JOIN users owner_user ON owner_user.id = o.user_id
+                WHERE o.package_id = p.id AND owner_user.handle =
+        "#,
+    );
+    rows_builder.push_bind(OFFICIAL_OWNER_HANDLE);
+    rows_builder.push(
+        r#"
+            ) AS is_official,
+            pv.manifest->>'description' AS description,
+            COALESCE(jsonb_array_length(pv.manifest->'modules'), 0)::int AS modules_count,
+            pv.manifest AS manifest
+        FROM packages p
+        LEFT JOIN package_versions pv ON pv.package_id = p.id AND pv.version = p.latest_version
+        WHERE 1=1
+        "#,
+    );
+    if let Some(like) = &like {
+        rows_builder.push(" AND p.name LIKE ");
+        rows_builder.push_bind(like);
+    }
+    if scale_tested {
+        rows_builder.push(" AND pv.scale_tested = true");
+    }
+    rows_builder.push(" ORDER BY p.name ASC LIMIT ");
+    rows_builder.push_bind(limit as i64);
+    rows_builder.push(" OFFSET ");
+    rows_builder.push_bind(offset as i64);
+
+    let rows: Vec<Row> = match rows_builder.build_query_as::<Row>().fetch_all(&state.db).await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select search: {err}"),
+            )
+        }
     };
 
     ok_json(SearchResponse {
@@ -4253,6 +4477,192 @@ async fn package_yank(
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct ScaleEvidenceRequest {
+    evidence_ref: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScaleEvidenceResponse {
+    ok: bool,
+    name: String,
+    version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scale_classes_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    scale_tested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale_test_evidence_ref: Option<String>,
+}
+
+async fn pack_scale_evidence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxPath((name, version)): AxPath<(String, String)>,
+    Json(req): Json<ScaleEvidenceRequest>,
+) -> Response {
+    let auth = match require_token(&headers, state.as_ref(), &["publish"]).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = validate_pkg_name(&name) {
+        return *resp;
+    }
+    if let Err(resp) = validate_version(&version) {
+        return *resp;
+    }
+
+    let evidence_ref = match validate_scale_evidence_ref(&state.cfg, &req.evidence_ref) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("begin transaction: {err}"),
+            )
+        }
+    };
+    let lock_id = advisory_lock_id(&name);
+    if let Err(err) = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_id)
+        .execute(&mut *tx)
+        .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("advisory lock: {err}"),
+        );
+    }
+
+    let pkg_id: Option<Uuid> = match sqlx::query_scalar("SELECT id FROM packages WHERE name = $1")
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select package: {err}"),
+            )
+        }
+    };
+    let Some(pkg_id) = pkg_id else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    if let Err(resp) = require_package_owner_manage(&mut tx, pkg_id, &auth).await {
+        return *resp;
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct VersionRow {
+        scale_classes_supported: Vec<String>,
+        scale_tested: bool,
+        scale_test_evidence_ref: Option<String>,
+    }
+
+    let existing: Option<VersionRow> = match sqlx::query_as(
+        "SELECT scale_classes_supported, scale_tested, scale_test_evidence_ref FROM package_versions WHERE package_id = $1 AND version = $2",
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("select version: {err}"),
+            )
+        }
+    };
+    let Some(existing) = existing else {
+        return json_error(StatusCode::NOT_FOUND, "X07REG_NOT_FOUND", "not found");
+    };
+
+    if let Some(ref cur) = existing.scale_test_evidence_ref {
+        if cur == &evidence_ref {
+            return ok_json(ScaleEvidenceResponse {
+                ok: true,
+                name,
+                version,
+                scale_classes_supported: existing.scale_classes_supported,
+                scale_tested: existing.scale_tested,
+                scale_test_evidence_ref: existing.scale_test_evidence_ref,
+            });
+        }
+        return json_error(
+            StatusCode::CONFLICT,
+            "X07REG_CONFLICT",
+            "scale evidence already set for this version",
+        );
+    }
+
+    let updated: VersionRow = match sqlx::query_as(
+        "UPDATE package_versions SET scale_tested = true, scale_test_evidence_ref = $3 WHERE package_id = $1 AND version = $2 RETURNING scale_classes_supported, scale_tested, scale_test_evidence_ref",
+    )
+    .bind(pkg_id)
+    .bind(&version)
+    .bind(&evidence_ref)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "X07REG_DB",
+                format!("update evidence: {err}"),
+            )
+        }
+    };
+
+    if let Err(err) = sqlx::query(
+        "INSERT INTO audit_events(actor_user_id, actor_token_id, action, package_name, package_version, details) VALUES ($1, $2, 'scale_evidence', $3, $4, $5)",
+    )
+    .bind(auth.user_id)
+    .bind(actor_token_id(&auth))
+    .bind(&name)
+    .bind(&version)
+    .bind(serde_json::json!({ "evidence_ref": evidence_ref }))
+    .execute(&mut *tx)
+    .await
+    {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("insert audit: {err}"),
+        );
+    }
+
+    if let Err(err) = tx.commit().await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_DB",
+            format!("commit: {err}"),
+        );
+    }
+
+    ok_json(ScaleEvidenceResponse {
+        ok: true,
+        name,
+        version,
+        scale_classes_supported: updated.scale_classes_supported,
+        scale_tested: updated.scale_tested,
+        scale_test_evidence_ref: updated.scale_test_evidence_ref,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct AdvisoriesResponse {
     ok: bool,
@@ -4839,6 +5249,12 @@ struct PackageMetadataResponse {
     is_official: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     facets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scale_classes_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    scale_tested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale_test_evidence_ref: Option<String>,
 }
 
 async fn package_metadata(
@@ -4858,6 +5274,9 @@ async fn package_metadata(
         manifest: serde_json::Value,
         cksum: String,
         is_official: bool,
+        scale_classes_supported: Vec<String>,
+        scale_tested: bool,
+        scale_test_evidence_ref: Option<String>,
     }
 
     let row: Option<MetaRow> = match sqlx::query_as(
@@ -4871,6 +5290,9 @@ async fn package_metadata(
                 JOIN users owner_user ON owner_user.id = o.user_id
                 WHERE o.package_id = p.id AND owner_user.handle = $3
             ) AS is_official
+            , pv.scale_classes_supported
+            , pv.scale_tested
+            , pv.scale_test_evidence_ref
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         WHERE p.name = $1 AND pv.version = $2
@@ -4899,6 +5321,9 @@ async fn package_metadata(
         manifest,
         cksum,
         is_official,
+        scale_classes_supported,
+        scale_tested,
+        scale_test_evidence_ref,
     } = row;
     let etag = format!("\"{}\"", cksum.as_str());
     if if_none_match(&headers, &etag) {
@@ -4922,6 +5347,9 @@ async fn package_metadata(
         package: pkg,
         cksum,
         is_official,
+        scale_classes_supported,
+        scale_tested,
+        scale_test_evidence_ref,
     });
     set_cache_headers(&mut resp, &etag, CACHE_CONTROL_PACKAGE_METADATA);
     resp
@@ -5026,6 +5454,10 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         .route("/v1/tokens", get(tokens_list).post(token_create))
         .route("/v1/tokens/{token_id}/revoke", post(token_revoke))
         .route("/v1/packages/publish", post(publish))
+        .route(
+            "/v1/packs/{name}/versions/{version}/scale-evidence",
+            post(pack_scale_evidence),
+        )
         .route("/v1/packages/{name}/{version}/download", get(download))
         .route(
             "/v1/packages/{name}/{version}/metadata",

@@ -129,6 +129,11 @@ All responses include an `x-request-id` header. JSON error responses include `re
 - `X07_REGISTRY_STORAGE`: `fs` or `s3` (S3-compatible object storage). Default: `fs`
 - `X07_REGISTRY_VERIFIED_NAMESPACES`: comma-separated list of official namespace prefixes (optional)
 
+Scale evidence allowlists (used by `GET /v1/packs/{name}/versions/{version}/scale-evidence`):
+
+- `X07_REGISTRY_SCALE_EVIDENCE_ALLOWED_HOSTS`: comma-separated hostnames allowed for `https://...` evidence refs (default: `x07.io`)
+- `X07_REGISTRY_SCALE_EVIDENCE_ALLOWED_S3_BUCKETS`: comma-separated S3 bucket names allowed for `s3://...` evidence refs (default: empty; S3 evidence disabled)
+
 Filesystem mode:
 
 - `X07_REGISTRY_DATA_DIR`: base data directory (default: `data`)

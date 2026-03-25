@@ -307,6 +307,27 @@
           "yanked": { "type": "boolean" }
         }
       },
+      "ScaleEvidenceRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_ref"],
+        "properties": {
+          "evidence_ref": { "type": "string" }
+        }
+      },
+      "ScaleEvidenceResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "name", "version"],
+        "properties": {
+          "ok": { "const": true },
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "scale_classes_supported": { "type": "array", "items": { "type": "string" } },
+          "scale_tested": { "type": "boolean" },
+          "scale_test_evidence_ref": { "type": ["string", "null"] }
+        }
+      },
       "PackageManifest": {
         "type": "object",
         "additionalProperties": false,
@@ -343,7 +364,10 @@
           "package": { "$ref": "#/components/schemas/PackageManifest" },
           "cksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
           "is_official": { "type": "boolean" },
-          "facets": { "type": "array", "items": { "type": "string" } }
+          "facets": { "type": "array", "items": { "type": "string" } },
+          "scale_classes_supported": { "type": "array", "items": { "type": "string" } },
+          "scale_tested": { "type": "boolean" },
+          "scale_test_evidence_ref": { "type": ["string", "null"] }
         }
       },
       "PackageVersionInfo": {
@@ -567,7 +591,8 @@
         "parameters": [
           { "name": "q", "in": "query", "required": false, "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer" } }
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer" } },
+          { "name": "scale_tested", "in": "query", "required": false, "schema": { "type": "boolean" } }
         ],
         "responses": {
           "200": {
@@ -729,6 +754,73 @@
           },
           "409": {
             "description": "Already published",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packs/{name}/versions/{version}/scale-evidence": {
+      "post": {
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ScaleEvidenceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Evidence attached",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ScaleEvidenceResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/ErrorResponse" }

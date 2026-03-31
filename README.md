@@ -1,5 +1,9 @@
 # X07 Registry
 
+## Agent Entrypoint
+
+Start here: https://x07lang.org/docs/getting-started/agent-quickstart
+
 `x07-registry` is the package registry API for the X07 ecosystem.
 
 This repo is where published X07 packages are stored, indexed, downloaded, and authenticated. In practical terms, it is the server behind the package workflows described in the core `x07` docs and surfaced to users through [`x07.io`](https://x07.io).

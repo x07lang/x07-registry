@@ -6024,6 +6024,7 @@ fn manifest_worlds_allowed(manifest: &PackageManifest) -> ApiResult<Vec<WorldId>
 fn lint_options_for_world(world: WorldId) -> x07c::lint::LintOptions {
     x07c::lint::LintOptions {
         world,
+        compat: x07c::compat::Compat::default(),
         enable_fs: matches!(
             world,
             WorldId::SolveFs | WorldId::SolveFull | WorldId::RunOs | WorldId::RunOsSandboxed

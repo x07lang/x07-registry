@@ -2608,7 +2608,10 @@ struct ScaleMetadata {
     scale_test_evidence_ref: Option<String>,
 }
 
-fn parse_scale_metadata(meta: Option<&serde_json::Value>, cfg: &RegistryConfig) -> ApiResult<ScaleMetadata> {
+fn parse_scale_metadata(
+    meta: Option<&serde_json::Value>,
+    cfg: &RegistryConfig,
+) -> ApiResult<ScaleMetadata> {
     let Some(meta) = meta.and_then(serde_json::Value::as_object) else {
         return Ok(ScaleMetadata {
             scale_classes_supported: Vec::new(),
@@ -2646,15 +2649,11 @@ fn parse_scale_metadata(meta: Option<&serde_json::Value>, cfg: &RegistryConfig) 
         .filter(|value| !value.is_empty())
         .map(|value| {
             let valid = value.len() <= 64
-                && value
-                    .as_bytes()
-                    .iter()
-                    .enumerate()
-                    .all(|(idx, b)| match b {
-                        b'a'..=b'z' => true,
-                        b'0'..=b'9' | b'-' => idx > 0,
-                        _ => false,
-                    });
+                && value.as_bytes().iter().enumerate().all(|(idx, b)| match b {
+                    b'a'..=b'z' => true,
+                    b'0'..=b'9' | b'-' => idx > 0,
+                    _ => false,
+                });
             if !valid {
                 return Err(boxed_json_error(
                     StatusCode::BAD_REQUEST,
@@ -2775,9 +2774,10 @@ fn validate_scale_evidence_ref(cfg: &RegistryConfig, raw: &str) -> ApiResult<Str
                     "evidence_ref host must be a public domain",
                 ));
             }
-            let allowed = cfg.scale_evidence_allowed_hosts.iter().any(|allowed| {
-                host == *allowed || host.ends_with(&format!(".{allowed}"))
-            });
+            let allowed = cfg
+                .scale_evidence_allowed_hosts
+                .iter()
+                .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")));
             if !allowed {
                 return Err(boxed_json_error(
                     StatusCode::BAD_REQUEST,
@@ -3561,7 +3561,11 @@ async fn search(
     rows_builder.push(" OFFSET ");
     rows_builder.push_bind(offset as i64);
 
-    let rows: Vec<Row> = match rows_builder.build_query_as::<Row>().fetch_all(&state.db).await {
+    let rows: Vec<Row> = match rows_builder
+        .build_query_as::<Row>()
+        .fetch_all(&state.db)
+        .await
+    {
         Ok(v) => v,
         Err(err) => {
             return json_error(
@@ -5958,7 +5962,7 @@ fn lint_package_archive(manifest: &PackageManifest, tar_bytes: &[u8]) -> ApiResu
 
     let mut msg = format!("x07AST lint failed ({total_errors} error(s)).");
     if !shown.is_empty() {
-        msg.push_str("\n");
+        msg.push('\n');
         msg.push_str(&shown.join("\n"));
     }
     Err(boxed_json_error(

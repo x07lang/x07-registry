@@ -154,6 +154,7 @@ fn base_config(
         session_ttl_seconds: 60 * 60,
         oauth_state_ttl_seconds: 600,
         require_verified_email_for_publish: true,
+        pkg_signing: None,
     }
 }
 
@@ -163,79 +164,10 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
 }
 
 fn make_tar_with_package_with_module(name: &str, version: &str, module_bytes: Vec<u8>) -> Vec<u8> {
-    let manifest = serde_json::json!({
-        "schema_version": "x07.package@0.1.0",
-        "name": name,
-        "description": "Test package used by x07-registry integration tests.",
-        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
-        "version": version,
-        "module_root": "modules",
-        "modules": ["hello.util"],
-    });
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
-
-    let mut buf = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut buf);
-        builder.mode(tar::HeaderMode::Deterministic);
-
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(manifest_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "x07-package.json",
-                std::io::Cursor::new(&manifest_bytes),
-            )
-            .expect("append manifest");
-
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(module_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "modules/hello/util.x07.json",
-                std::io::Cursor::new(&module_bytes),
-            )
-            .expect("append module");
-
-        builder.finish().expect("finish tar");
-    }
-    buf
+    make_tar_with_package_with_modules(name, version, None, vec![("hello.util", module_bytes)])
 }
 
-fn make_tar_with_package_with_modules(
-    name: &str,
-    version: &str,
-    meta: Option<Value>,
-    modules: Vec<(&str, Vec<u8>)>,
-) -> Vec<u8> {
-    let module_ids: Vec<&str> = modules.iter().map(|(id, _)| *id).collect();
-    let mut manifest = serde_json::json!({
-        "schema_version": "x07.package@0.1.0",
-        "name": name,
-        "description": "Test package used by x07-registry integration tests.",
-        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
-        "version": version,
-        "module_root": "modules",
-        "modules": module_ids,
-    });
-    if let Some(meta) = meta {
-        manifest["meta"] = meta;
-    }
-
+fn make_tar_with_manifest_and_modules(manifest: Value, modules: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
 
     let mut buf = Vec::new();
@@ -277,6 +209,34 @@ fn make_tar_with_package_with_modules(
         builder.finish().expect("finish tar");
     }
     buf
+}
+
+fn make_tar_with_package_with_modules(
+    name: &str,
+    version: &str,
+    meta: Option<Value>,
+    modules: Vec<(&str, Vec<u8>)>,
+) -> Vec<u8> {
+    let module_ids: Vec<&str> = modules.iter().map(|(id, _)| *id).collect();
+    let mut meta_obj = meta
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    meta_obj.entry("x07c_compat".to_string()).or_insert_with(|| {
+        Value::String(">=0.1.111 <0.3.0".to_string())
+    });
+    let mut manifest = serde_json::json!({
+        "schema_version": "x07.package@0.1.0",
+        "name": name,
+        "description": "Test package used by x07-registry integration tests.",
+        "license": "MIT OR Apache-2.0",
+        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
+        "version": version,
+        "module_root": "modules",
+        "modules": module_ids,
+    });
+    manifest["meta"] = Value::Object(meta_obj);
+
+    make_tar_with_manifest_and_modules(manifest, modules)
 }
 
 #[tokio::test]
@@ -549,6 +509,109 @@ async fn index_config_is_ok() {
     assert_eq!(json["sparse"], Value::Bool(true));
     assert!(json["dl"].as_str().unwrap().ends_with("/v1/packages/"));
     assert!(json["api"].as_str().unwrap().ends_with("/v1/"));
+}
+
+#[tokio::test]
+async fn index_signing_exposes_public_key_and_entry_signatures_verify() {
+    use base64::Engine as _;
+    use ed25519_dalek::Verifier as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+
+    let mut cfg = base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    );
+    cfg.pkg_signing = Some(x07_registry::RegistryPkgSigningConfig {
+        key_id: "test-ed25519".to_string(),
+        ed25519_seed: [7u8; 32],
+    });
+    let app = x07_registry::app_with_config(cfg).await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let cfg_json = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/index/config.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    assert_eq!(
+        cfg_json["signing"]["kind"],
+        Value::String("ed25519".to_string())
+    );
+    let key = &cfg_json["signing"]["public_keys"][0];
+    assert_eq!(key["id"], Value::String("test-ed25519".to_string()));
+    let pub_b64 = key["ed25519_pub"].as_str().expect("ed25519_pub");
+    let pub_bytes = base64::engine::general_purpose::STANDARD
+        .decode(pub_b64)
+        .expect("base64 decode ed25519_pub");
+    let pub_bytes: [u8; 32] = pub_bytes.try_into().expect("ed25519_pub length");
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes).expect("verifying key");
+
+    let tar = make_tar_with_package("hello", "0.1.0");
+    let cksum = sha256_hex(&tar);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(json["cksum"], Value::String(cksum.clone()));
+    let index_path = json["index_path"].as_str().expect("index_path str");
+
+    let index_json: Value = {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(index_path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("index utf-8");
+        let line = text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("ndjson line");
+        serde_json::from_str(line).expect("parse ndjson line")
+    };
+
+    let sig_b64 = index_json["signature"]["ed25519_sig"]
+        .as_str()
+        .expect("ed25519_sig");
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .expect("base64 decode ed25519_sig");
+    let sig_bytes: [u8; 64] = sig_bytes.try_into().expect("ed25519_sig length");
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let msg = format!("x07.pkg.sig.v1\nname=hello\nversion=0.1.0\nsha256={cksum}\n");
+    vk.verify(msg.as_bytes(), &sig).expect("verify signature");
 }
 
 #[tokio::test]
@@ -1283,6 +1346,107 @@ async fn publish_rejects_invalid_x07ast() {
         .as_str()
         .expect("message str")
         .contains("invalid JSON"));
+}
+
+#[tokio::test]
+async fn publish_rejects_missing_license() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let module_bytes = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "x07c_compat".to_string(),
+        Value::String(">=0.1.111 <0.3.0".to_string()),
+    );
+    let manifest = serde_json::json!({
+        "schema_version": "x07.package@0.1.0",
+        "name": "hello",
+        "description": "Test package used by x07-registry integration tests.",
+        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
+        "version": "0.1.0",
+        "module_root": "modules",
+        "modules": ["hello.util"],
+        "meta": Value::Object(meta),
+    });
+    let tar = make_tar_with_manifest_and_modules(manifest, vec![("hello.util", module_bytes)]);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["code"],
+        Value::String("X07REG_PKG_LICENSE_REQUIRED".to_string())
+    );
+}
+
+#[tokio::test]
+async fn publish_rejects_missing_x07c_compat() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let module_bytes = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
+    let manifest = serde_json::json!({
+        "schema_version": "x07.package@0.1.0",
+        "name": "hello",
+        "description": "Test package used by x07-registry integration tests.",
+        "license": "MIT OR Apache-2.0",
+        "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
+        "version": "0.1.0",
+        "module_root": "modules",
+        "modules": ["hello.util"],
+    });
+    let tar = make_tar_with_manifest_and_modules(manifest, vec![("hello.util", module_bytes)]);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = read_body_json(resp.into_body()).await;
+    assert_eq!(
+        json["code"],
+        Value::String("X07REG_PKG_X07C_COMPAT_REQUIRED".to_string())
+    );
 }
 
 #[tokio::test]

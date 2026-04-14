@@ -19,9 +19,11 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::Signer as _;
 use rand::RngCore;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -125,6 +127,68 @@ pub struct GithubOAuthConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct RegistryPkgSigningConfig {
+    pub key_id: String,
+    pub ed25519_seed: [u8; 32],
+}
+
+impl RegistryPkgSigningConfig {
+    fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&self.ed25519_seed)
+    }
+
+    fn ed25519_public_key_b64(&self) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pub_bytes = self.signing_key().verifying_key().to_bytes();
+        b64.encode(pub_bytes)
+    }
+}
+
+fn pkg_sig_message_v1(name: &str, version: &str, sha256_hex: &str) -> Vec<u8> {
+    format!(
+        "x07.pkg.sig.v1\nname={}\nversion={}\nsha256={}\n",
+        name.trim(),
+        version.trim(),
+        sha256_hex.trim()
+    )
+    .into_bytes()
+}
+
+fn sign_pkg_digest_v1(
+    cfg: &RegistryPkgSigningConfig,
+    name: &str,
+    version: &str,
+    sha256_hex: &str,
+) -> [u8; 64] {
+    let msg = pkg_sig_message_v1(name, version, sha256_hex);
+    let sig: ed25519_dalek::Signature = cfg.signing_key().sign(&msg);
+    sig.to_bytes()
+}
+
+fn normalize_x07c_compat_req(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains(',') {
+        return trimmed.to_string();
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() <= 1 {
+        return trimmed.to_string();
+    }
+    parts.join(", ")
+}
+
+fn validate_x07c_compat_req(raw: &str) -> Result<(), String> {
+    let normalized = normalize_x07c_compat_req(raw);
+    if normalized.is_empty() {
+        return Err("empty semver requirement".to_string());
+    }
+    VersionReq::parse(&normalized).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone)]
 pub struct RegistryConfig {
     pub public_base: String,
     pub web_base: String,
@@ -142,6 +206,7 @@ pub struct RegistryConfig {
     pub session_ttl_seconds: i64,
     pub oauth_state_ttl_seconds: i64,
     pub require_verified_email_for_publish: bool,
+    pub pkg_signing: Option<RegistryPkgSigningConfig>,
 }
 
 impl RegistryConfig {
@@ -287,6 +352,45 @@ impl RegistryConfig {
             }
             other => panic!("unsupported X07_REGISTRY_STORAGE={other:?}"),
         };
+
+        let pkg_signing =
+            std::env::var("X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|secret_b64| {
+                    let kind = std::env::var("X07_REGISTRY_PKG_SIGNING_KIND")
+                        .unwrap_or_else(|_| "ed25519".to_string());
+                    if kind.trim() != "ed25519" {
+                        panic!("unsupported X07_REGISTRY_PKG_SIGNING_KIND={kind:?} (expected \"ed25519\")");
+                    }
+
+                    let key_id = std::env::var("X07_REGISTRY_PKG_SIGNING_KEY_ID")
+                        .unwrap_or_else(|_| panic!("missing X07_REGISTRY_PKG_SIGNING_KEY_ID (required when X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64 is set)"));
+                    let key_id = key_id.trim().to_string();
+                    if key_id.is_empty() {
+                        panic!("X07_REGISTRY_PKG_SIGNING_KEY_ID must be non-empty");
+                    }
+
+                    let b64 = base64::engine::general_purpose::STANDARD;
+                    let bytes = b64
+                        .decode(secret_b64.as_bytes())
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "invalid X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64: {err}"
+                            )
+                        });
+                    if bytes.len() != 32 {
+                        panic!(
+                            "invalid X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64: expected 32 bytes, got {}",
+                            bytes.len()
+                        );
+                    }
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+
+                    RegistryPkgSigningConfig { key_id, ed25519_seed: seed }
+                });
         Self {
             public_base,
             web_base,
@@ -304,6 +408,7 @@ impl RegistryConfig {
             session_ttl_seconds,
             oauth_state_ttl_seconds,
             require_verified_email_for_publish,
+            pkg_signing,
         }
     }
 }
@@ -1803,6 +1908,18 @@ async fn auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 }
 
 #[derive(Debug, Serialize)]
+struct IndexSigningPublicKey {
+    id: String,
+    ed25519_pub: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexSigningConfig {
+    kind: String,
+    public_keys: Vec<IndexSigningPublicKey>,
+}
+
+#[derive(Debug, Serialize)]
 struct IndexConfig {
     dl: String,
     api: String,
@@ -1811,9 +1928,18 @@ struct IndexConfig {
     sparse: bool,
     #[serde(rename = "verified-namespaces", skip_serializing_if = "Vec::is_empty")]
     verified_namespaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing: Option<IndexSigningConfig>,
 }
 
 async fn index_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let signing = state.cfg.pkg_signing.as_ref().map(|cfg| IndexSigningConfig {
+        kind: "ed25519".to_string(),
+        public_keys: vec![IndexSigningPublicKey {
+            id: cfg.key_id.clone(),
+            ed25519_pub: cfg.ed25519_public_key_b64(),
+        }],
+    });
     let cfg = IndexConfig {
         dl: format!(
             "{}/v1/packages/",
@@ -1823,6 +1949,7 @@ async fn index_config(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         auth_required: false,
         sparse: true,
         verified_namespaces: state.cfg.verified_namespaces.clone(),
+        signing,
     };
 
     let cfg_bytes = serde_json::to_vec(&cfg).expect("serialize index config");
@@ -1997,6 +2124,9 @@ async fn index_file(
         yanked: bool,
         description: Option<String>,
         docs: Option<String>,
+        signature_kind: Option<String>,
+        signature_key_id: Option<String>,
+        signature_bytes: Option<Vec<u8>>,
     }
 
     let mut versions: Vec<VersionRow> = match sqlx::query_as(
@@ -2006,7 +2136,10 @@ async fn index_file(
             pv.cksum,
             pv.yanked,
             pv.manifest->>'description' AS description,
-            pv.manifest->>'docs' AS docs
+            pv.manifest->>'docs' AS docs,
+            pv.signature_kind,
+            pv.signature_key_id,
+            pv.signature_bytes
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         WHERE p.name = $1
@@ -2127,6 +2260,39 @@ async fn index_file(
         let advisories = advisories_by_version
             .remove(&row.version)
             .unwrap_or_default();
+        let signature = match row.signature_kind.as_deref() {
+            Some(kind) => {
+                if kind.trim() != "ed25519" {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB_CORRUPT",
+                        format!(
+                            "unsupported package signature kind {:?} for {}@{}",
+                            kind, name, row.version
+                        ),
+                    );
+                }
+                let key_id = row.signature_key_id.as_deref().unwrap_or("").trim();
+                let bytes = row.signature_bytes.as_deref().unwrap_or(&[]);
+                if key_id.is_empty() || bytes.is_empty() {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "X07REG_DB_CORRUPT",
+                        format!(
+                            "package signature is incomplete for {}@{}",
+                            name, row.version
+                        ),
+                    );
+                }
+                let b64 = base64::engine::general_purpose::STANDARD;
+                Some(IndexSignatureLine {
+                    kind: "ed25519".to_string(),
+                    key_id: key_id.to_string(),
+                    ed25519_sig: b64.encode(bytes),
+                })
+            }
+            None => None,
+        };
         let line = IndexEntryLine {
             schema_version: "x07.index-entry@0.1.0".to_string(),
             name: name.to_string(),
@@ -2135,6 +2301,7 @@ async fn index_file(
             yanked: row.yanked,
             description: row.description.clone(),
             docs: row.docs.clone(),
+            signature,
             advisories,
         };
         out.push_str(&serde_json::to_string(&line).expect("serialize index entry"));
@@ -2492,6 +2659,8 @@ struct PackageManifest {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     docs: Option<String>,
     version: String,
@@ -2979,6 +3148,53 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             "x07-package.json must include a non-empty \"docs\" field",
         );
     }
+    if manifest.license.as_deref().unwrap_or("").trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_PKG_LICENSE_REQUIRED",
+            "x07-package.json must include a non-empty \"license\" field",
+        );
+    }
+
+    let x07c_compat = manifest
+        .meta
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get("x07c_compat"));
+    let x07c_compat = match x07c_compat {
+        Some(serde_json::Value::String(raw)) => raw.trim(),
+        Some(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_PKG_X07C_COMPAT_INVALID",
+                "x07-package.json meta.x07c_compat must be a string",
+            )
+        }
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "X07REG_PKG_X07C_COMPAT_REQUIRED",
+                "x07-package.json must include meta.x07c_compat (semver range, e.g. \">=0.1.111 <0.3.0\")",
+            )
+        }
+    };
+    if x07c_compat.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_PKG_X07C_COMPAT_REQUIRED",
+            "x07-package.json meta.x07c_compat must be non-empty (semver range, e.g. \">=0.1.111 <0.3.0\")",
+        );
+    }
+    if let Err(err) = validate_x07c_compat_req(x07c_compat) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "X07REG_PKG_X07C_COMPAT_INVALID",
+            format!(
+                "invalid x07-package.json meta.x07c_compat {:?} ({err}); expected a semver range like \">=0.1.111 <0.3.0\"",
+                x07c_compat
+            ),
+        );
+    }
 
     if let Err(resp) = lint_package_archive(&manifest, &bytes) {
         return *resp;
@@ -2988,6 +3204,17 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
 
     let pkg_name = &manifest.name;
     let pkg_version = &manifest.version;
+    let (sig_kind, sig_key_id, sig_bytes) = match state.cfg.pkg_signing.as_ref() {
+        Some(cfg) => {
+            let sig = sign_pkg_digest_v1(cfg, pkg_name, pkg_version, &cksum);
+            (
+                Some("ed25519".to_string()),
+                Some(cfg.key_id.clone()),
+                Some(sig.to_vec()),
+            )
+        }
+        None => (None, None, None),
+    };
     let index_rel = match index_relative_path(pkg_name) {
         Ok(p) => p,
         Err(resp) => return *resp,
@@ -3175,13 +3402,16 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         Err(resp) => return *resp,
     };
     if let Err(err) = sqlx::query(
-        "INSERT INTO package_versions(package_id, version, cksum, yanked, manifest, published_by, scale_classes_supported, scale_tested, scale_test_evidence_ref) VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8)",
+        "INSERT INTO package_versions(package_id, version, cksum, yanked, manifest, published_by, signature_kind, signature_key_id, signature_bytes, scale_classes_supported, scale_tested, scale_test_evidence_ref) VALUES ($1, $2, $3, false, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(package_id)
     .bind(pkg_version)
     .bind(&cksum)
     .bind(manifest_json)
     .bind(auth.user_id)
+    .bind(sig_kind)
+    .bind(sig_key_id)
+    .bind(sig_bytes)
     .bind(scale_meta.scale_classes_supported)
     .bind(scale_meta.scale_tested)
     .bind(scale_meta.scale_test_evidence_ref)
@@ -3339,6 +3569,13 @@ struct PkgAdvisory {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct IndexSignatureLine {
+    kind: String,
+    key_id: String,
+    ed25519_sig: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct IndexEntryLine {
     schema_version: String,
     name: String,
@@ -3350,6 +3587,8 @@ struct IndexEntryLine {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     docs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<IndexSignatureLine>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     advisories: Vec<PkgAdvisory>,
 }

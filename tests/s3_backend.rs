@@ -103,6 +103,7 @@ fn base_config(
         session_ttl_seconds: 60 * 60,
         oauth_state_ttl_seconds: 600,
         require_verified_email_for_publish: true,
+        pkg_signing: None,
     }
 }
 
@@ -111,10 +112,12 @@ fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
         "schema_version": "x07.package@0.1.0",
         "name": name,
         "description": "Test package used by x07-registry S3 integration tests.",
+        "license": "MIT OR Apache-2.0",
         "docs": "This package exists for x07-registry tests.\n\nUsage:\n- x07 pkg add <name>@<version>\n",
         "version": version,
         "module_root": "modules",
         "modules": ["hello.util"],
+        "meta": { "x07c_compat": ">=0.1.111 <0.3.0" }
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
 

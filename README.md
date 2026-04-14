@@ -73,5 +73,17 @@ Common environment variables:
 - `X07_REGISTRY_WEB_BASE`
 - `X07_REGISTRY_DATABASE_URL`
 - `X07_REGISTRY_STORAGE`
+- `X07_REGISTRY_PKG_SIGNING_KIND` (optional; currently `ed25519`)
+- `X07_REGISTRY_PKG_SIGNING_KEY_ID` (required when signing is enabled)
+- `X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64` (optional; enables signing when set)
 
 See the source configuration handling and [`docs/auth.md`](docs/auth.md) for the full operational picture.
+
+## Publishing requirements
+
+Published package archives must include `x07-package.json` with:
+
+- `description`, `docs`, and `license` (non-empty strings)
+- `meta.x07c_compat` (required semver range, for example `>=0.1.111 <0.3.0`)
+
+When package signing is enabled, the sparse index (`/index/`) advertises the signing public key in `config.json`, and index entries include a signature over `name`, `version`, and the package tarball sha256 (`cksum`).

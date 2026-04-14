@@ -27,7 +27,30 @@
           "api": { "type": "string", "format": "uri" },
           "auth-required": { "type": "boolean" },
           "sparse": { "const": true },
-          "verified-namespaces": { "type": "array", "items": { "type": "string" } }
+          "verified-namespaces": { "type": "array", "items": { "type": "string" } },
+          "signing": { "$ref": "#/components/schemas/IndexSigning" }
+        }
+      },
+      "IndexSigningPublicKey": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "ed25519_pub"],
+        "properties": {
+          "id": { "type": "string" },
+          "ed25519_pub": { "type": "string" }
+        }
+      },
+      "IndexSigning": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "public_keys"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["ed25519"] },
+          "public_keys": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/IndexSigningPublicKey" }
+          }
         }
       },
       "IndexCatalogPackage": {
@@ -331,16 +354,24 @@
       "PackageManifest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "name", "version", "module_root", "modules"],
+        "required": ["schema_version", "name", "description", "license", "docs", "version", "module_root", "modules", "meta"],
         "properties": {
           "schema_version": { "type": "string" },
           "name": { "type": "string" },
           "description": { "type": "string" },
+          "license": { "type": "string" },
           "docs": { "type": "string" },
           "version": { "type": "string" },
           "module_root": { "type": "string" },
           "modules": { "type": "array", "items": { "type": "string" } },
-          "meta": { "type": "object" }
+          "meta": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["x07c_compat"],
+            "properties": {
+              "x07c_compat": { "type": "string" }
+            }
+          }
         }
       },
       "PublishResponse": {

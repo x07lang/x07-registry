@@ -87,3 +87,5 @@ Published package archives must include `x07-package.json` with:
 - `meta.x07c_compat` (required semver range, for example `>=0.1.111 <0.3.0`)
 
 When package signing is enabled, the sparse index (`/index/`) advertises the signing public key in `config.json`, and index entries include a signature over `name`, `version`, and the package tarball sha256 (`cksum`).
+
+Signing does not require republishing archives: existing packages can remain unsigned (clients will report them as such), and the registry can backfill signatures for historical `name+version+cksum` entries later without re-uploading tarballs.

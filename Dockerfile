@@ -8,7 +8,7 @@ COPY src ./src
 COPY openapi ./openapi
 COPY migrations ./migrations
 
-RUN cargo build --release
+RUN cargo build --release --bin x07-registry --bin x07-registry-admin
 
 FROM debian:bookworm-slim
 
@@ -17,6 +17,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/x07-registry /usr/local/bin/x07-registry
+COPY --from=builder /src/target/release/x07-registry-admin /usr/local/bin/x07-registry-admin
 
 ENV X07_REGISTRY_BIND=0.0.0.0:8080
 EXPOSE 8080

@@ -165,6 +165,141 @@ fn sign_pkg_digest_v1(
     sig.to_bytes()
 }
 
+#[derive(Debug, Serialize)]
+pub struct BackfillPkgSignaturesReport {
+    pub total_versions: i64,
+    pub unsigned_before: i64,
+    pub unsigned_after: i64,
+    pub backfilled: i64,
+    pub dry_run: bool,
+    pub key_id: String,
+}
+
+pub async fn backfill_pkg_signatures(
+    db: &PgPool,
+    signing: &RegistryPkgSigningConfig,
+    dry_run: bool,
+) -> Result<BackfillPkgSignaturesReport, String> {
+    const BATCH_SIZE: i64 = 200;
+
+    let total_versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM package_versions")
+        .fetch_one(db)
+        .await
+        .map_err(|err| format!("select package_versions count: {err}"))?;
+
+    let unsigned_before: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM package_versions
+        WHERE signature_kind IS NULL OR signature_kind = ''
+           OR signature_key_id IS NULL OR signature_key_id = ''
+           OR signature_bytes IS NULL OR octet_length(signature_bytes) = 0
+        "#,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|err| format!("select unsigned package_versions count: {err}"))?;
+
+    #[derive(sqlx::FromRow)]
+    struct UnsignedRow {
+        package_id: Uuid,
+        name: String,
+        version: String,
+        cksum: String,
+    }
+
+    let mut backfilled: i64 = 0;
+    loop {
+        let rows: Vec<UnsignedRow> = sqlx::query_as(
+            r#"
+            SELECT
+                pv.package_id,
+                p.name,
+                pv.version,
+                pv.cksum
+            FROM package_versions pv
+            JOIN packages p ON p.id = pv.package_id
+            WHERE pv.signature_kind IS NULL OR pv.signature_kind = ''
+               OR pv.signature_key_id IS NULL OR pv.signature_key_id = ''
+               OR pv.signature_bytes IS NULL OR octet_length(pv.signature_bytes) = 0
+            ORDER BY p.name ASC, pv.version ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(BATCH_SIZE)
+        .fetch_all(db)
+        .await
+        .map_err(|err| format!("select unsigned package_versions: {err}"))?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let sig = sign_pkg_digest_v1(signing, &row.name, &row.version, &row.cksum);
+            if dry_run {
+                backfilled += 1;
+                continue;
+            }
+
+            let updated = sqlx::query(
+                r#"
+                UPDATE package_versions
+                SET signature_kind = $1,
+                    signature_key_id = $2,
+                    signature_bytes = $3
+                WHERE package_id = $4
+                  AND version = $5
+                  AND (signature_kind IS NULL OR signature_kind = ''
+                       OR signature_key_id IS NULL OR signature_key_id = ''
+                       OR signature_bytes IS NULL OR octet_length(signature_bytes) = 0)
+                "#,
+            )
+            .bind("ed25519")
+            .bind(&signing.key_id)
+            .bind(sig.to_vec())
+            .bind(row.package_id)
+            .bind(&row.version)
+            .execute(db)
+            .await
+            .map_err(|err| format!("backfill signature for {}@{}: {err}", row.name, row.version))?;
+
+            let n = updated.rows_affected();
+            if n == 0 {
+                continue;
+            }
+            if n != 1 {
+                return Err(format!(
+                    "expected to backfill 1 signature for {}@{}, updated {n}",
+                    row.name, row.version
+                ));
+            }
+            backfilled += 1;
+        }
+    }
+
+    let unsigned_after: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM package_versions
+        WHERE signature_kind IS NULL OR signature_kind = ''
+           OR signature_key_id IS NULL OR signature_key_id = ''
+           OR signature_bytes IS NULL OR octet_length(signature_bytes) = 0
+        "#,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|err| format!("select unsigned package_versions count: {err}"))?;
+
+    Ok(BackfillPkgSignaturesReport {
+        total_versions,
+        unsigned_before,
+        unsigned_after,
+        backfilled,
+        dry_run,
+        key_id: signing.key_id.clone(),
+    })
+}
+
 fn normalize_x07c_compat_req(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -5602,6 +5737,35 @@ pub async fn app() -> Router {
     app_with_config(RegistryConfig::from_env()).await
 }
 
+pub async fn connect_db(cfg: &RegistryConfig) -> PgPool {
+    if !is_valid_db_schema_name(&cfg.database_schema) {
+        panic!("invalid X07_REGISTRY_DATABASE_SCHEMA");
+    }
+    let schema = cfg.database_schema.clone();
+    let db = PgPoolOptions::new()
+        .max_connections(10)
+        .after_connect(move |conn, _meta| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                let stmt = format!("SET search_path TO \"{schema}\", public");
+                sqlx::query(&stmt).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(&cfg.database_url)
+        .await
+        .expect("connect postgres");
+
+    let create_schema_stmt = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", cfg.database_schema);
+    sqlx::query(&create_schema_stmt)
+        .execute(&db)
+        .await
+        .expect("create postgres schema");
+    sqlx::migrate!().run(&db).await.expect("migrate postgres");
+
+    db
+}
+
 pub async fn app_with_config(cfg: RegistryConfig) -> Router {
     let cors = cors_layer(&cfg);
 
@@ -5635,30 +5799,7 @@ pub async fn app_with_config(cfg: RegistryConfig) -> Router {
         }
     };
 
-    if !is_valid_db_schema_name(&cfg.database_schema) {
-        panic!("invalid X07_REGISTRY_DATABASE_SCHEMA");
-    }
-    let schema = cfg.database_schema.clone();
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .after_connect(move |conn, _meta| {
-            let schema = schema.clone();
-            Box::pin(async move {
-                let stmt = format!("SET search_path TO \"{schema}\", public");
-                sqlx::query(&stmt).execute(conn).await?;
-                Ok(())
-            })
-        })
-        .connect(&cfg.database_url)
-        .await
-        .expect("connect postgres");
-
-    let create_schema_stmt = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", cfg.database_schema);
-    sqlx::query(&create_schema_stmt)
-        .execute(&db)
-        .await
-        .expect("create postgres schema");
-    sqlx::migrate!().run(&db).await.expect("migrate postgres");
+    let db = connect_db(&cfg).await;
 
     let http = reqwest::Client::builder()
         .user_agent(USER_AGENT)

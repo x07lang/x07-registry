@@ -89,3 +89,21 @@ Published package archives must include `x07-package.json` with:
 When package signing is enabled, the sparse index (`/index/`) advertises the signing public key in `config.json`, and index entries include a signature over `name`, `version`, and the package tarball sha256 (`cksum`).
 
 Signing does not require republishing archives: existing packages can remain unsigned (clients will report them as such), and the registry can backfill signatures for historical `name+version+cksum` entries later without re-uploading tarballs.
+
+## Ops: backfill signatures
+
+When signing is enabled, previously published versions may be missing signatures. Backfill updates the `package_versions.signature_*` columns in Postgres (no tarball re-upload).
+
+Dry-run:
+
+```sh
+cargo run --bin x07-registry-admin -- backfill-pkg-signatures
+```
+
+Apply:
+
+```sh
+cargo run --bin x07-registry-admin -- backfill-pkg-signatures --write
+```
+
+This requires signing env vars (see Configuration), in particular `X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64` and `X07_REGISTRY_PKG_SIGNING_KEY_ID`.

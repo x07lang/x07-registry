@@ -615,6 +615,157 @@ async fn index_signing_exposes_public_key_and_entry_signatures_verify() {
 }
 
 #[tokio::test]
+async fn index_signing_backfill_restores_missing_entry_signatures() {
+    use base64::Engine as _;
+    use ed25519_dalek::Verifier as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+
+    let signing = x07_registry::RegistryPkgSigningConfig {
+        key_id: "test-ed25519".to_string(),
+        ed25519_seed: [7u8; 32],
+    };
+    let mut cfg = base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    );
+    cfg.pkg_signing = Some(signing.clone());
+    let app = x07_registry::app_with_config(cfg).await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let cfg_json = read_body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/index/config.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await;
+    let pub_b64 = cfg_json["signing"]["public_keys"][0]["ed25519_pub"]
+        .as_str()
+        .expect("ed25519_pub");
+    let pub_bytes = base64::engine::general_purpose::STANDARD
+        .decode(pub_b64)
+        .expect("base64 decode ed25519_pub");
+    let pub_bytes: [u8; 32] = pub_bytes.try_into().expect("ed25519_pub length");
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes).expect("verifying key");
+
+    let tar = make_tar_with_package("hello", "0.1.0");
+    let cksum = sha256_hex(&tar);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = read_body_json(resp.into_body()).await;
+    let index_path = json["index_path"].as_str().expect("index_path str").to_string();
+
+    let pool = connect_test_db(&database_url, &database_schema).await;
+    let cleared = sqlx::query(
+        r#"
+        UPDATE package_versions pv
+        SET signature_kind = NULL,
+            signature_key_id = NULL,
+            signature_bytes = NULL
+        FROM packages p
+        WHERE p.id = pv.package_id AND p.name = $1 AND pv.version = $2
+        "#,
+    )
+    .bind("hello")
+    .bind("0.1.0")
+    .execute(&pool)
+    .await
+    .expect("clear signature");
+    assert_eq!(cleared.rows_affected(), 1);
+
+    let index_json: Value = {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&index_path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("index utf-8");
+        let line = text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("ndjson line");
+        serde_json::from_str(line).expect("parse ndjson line")
+    };
+    assert!(
+        index_json.get("signature").is_none(),
+        "expected signature to be absent before backfill, got: {index_json}"
+    );
+
+    let report = x07_registry::backfill_pkg_signatures(&pool, &signing, false)
+        .await
+        .expect("backfill signatures");
+    assert_eq!(report.total_versions, 1);
+    assert_eq!(report.unsigned_before, 1);
+    assert_eq!(report.unsigned_after, 0);
+    assert_eq!(report.backfilled, 1);
+    assert_eq!(report.dry_run, false);
+
+    let index_json: Value = {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&index_path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("index utf-8");
+        let line = text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("ndjson line");
+        serde_json::from_str(line).expect("parse ndjson line")
+    };
+
+    let sig_b64 = index_json["signature"]["ed25519_sig"]
+        .as_str()
+        .expect("ed25519_sig");
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .expect("base64 decode ed25519_sig");
+    let sig_bytes: [u8; 64] = sig_bytes.try_into().expect("ed25519_sig length");
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let msg = format!("x07.pkg.sig.v1\nname=hello\nversion=0.1.0\nsha256={cksum}\n");
+    vk.verify(msg.as_bytes(), &sig).expect("verify signature");
+}
+
+#[tokio::test]
 async fn index_root_redirects_to_catalog() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (database_url, database_schema) = create_test_schema().await;

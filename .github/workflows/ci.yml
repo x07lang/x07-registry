@@ -122,8 +122,14 @@ jobs:
         if: ${{ env.DO_API_TOKEN != '' && env.DO_REGISTRY_APP_ID != '' }}
         uses: digitalocean/action-doctl@v2
         with:
-          token: ${{ env.DO_API_TOKEN }}
+          no_auth: true
 
       - name: Trigger deployment
         if: ${{ env.DO_API_TOKEN != '' && env.DO_REGISTRY_APP_ID != '' }}
-        run: doctl apps create-deployment ${{ env.DO_REGISTRY_APP_ID }}
+        run: |
+          set -euo pipefail
+          if ! doctl auth init -t "$DO_API_TOKEN"; then
+            echo "::warning::DigitalOcean token rejected; skipping deployment (rotate DO_API_TOKEN secret)."
+            exit 0
+          fi
+          doctl apps create-deployment "$DO_REGISTRY_APP_ID"

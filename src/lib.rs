@@ -22,7 +22,7 @@ use axum::Router;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer as _;
-use rand::RngCore;
+use rand::TryRngCore;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -320,7 +320,9 @@ fn validate_x07c_compat_req(raw: &str) -> Result<(), String> {
     if normalized.is_empty() {
         return Err("empty semver requirement".to_string());
     }
-    VersionReq::parse(&normalized).map(|_| ()).map_err(|e| e.to_string())
+    VersionReq::parse(&normalized)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +788,16 @@ fn json_error(status: StatusCode, code: &'static str, message: impl Into<String>
         }),
     )
         .into_response()
+}
+
+fn fill_secure_random(raw: &mut [u8]) -> Result<(), Response> {
+    rand::rngs::OsRng.try_fill_bytes(raw).map_err(|err| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "X07REG_RANDOM",
+            format!("secure random generation failed: {err}"),
+        )
+    })
 }
 
 fn boxed_json_error(
@@ -1309,9 +1321,10 @@ async fn auth_github_start(
         Utc::now() + chrono::Duration::seconds(state.cfg.oauth_state_ttl_seconds.clamp(1, 3600));
 
     let oauth_state = {
-        let mut rng = rand::rngs::OsRng;
         let mut raw = [0u8; 32];
-        rng.fill_bytes(&mut raw);
+        if let Err(resp) = fill_secure_random(&mut raw) {
+            return resp;
+        }
         let state = format!("x07o_{}", sha256_hex(&raw));
         state
     };
@@ -1842,13 +1855,16 @@ async fn auth_github_callback(
     };
 
     let (session_token, session_token_hash, csrf_token, expires_at) = {
-        let mut rng = rand::rngs::OsRng;
         let mut raw = [0u8; 32];
-        rng.fill_bytes(&mut raw);
+        if let Err(resp) = fill_secure_random(&mut raw) {
+            return resp;
+        }
         let session_token = format!("x07s_{}", sha256_hex(&raw));
         let session_token_hash = sha256_hex(session_token.as_bytes());
         let mut raw = [0u8; 32];
-        rng.fill_bytes(&mut raw);
+        if let Err(resp) = fill_secure_random(&mut raw) {
+            return resp;
+        }
         let csrf_token = format!("x07c_{}", sha256_hex(&raw));
         let expires_at = Utc::now()
             + chrono::Duration::seconds(
@@ -2068,13 +2084,17 @@ struct IndexConfig {
 }
 
 async fn index_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let signing = state.cfg.pkg_signing.as_ref().map(|cfg| IndexSigningConfig {
-        kind: "ed25519".to_string(),
-        public_keys: vec![IndexSigningPublicKey {
-            id: cfg.key_id.clone(),
-            ed25519_pub: cfg.ed25519_public_key_b64(),
-        }],
-    });
+    let signing = state
+        .cfg
+        .pkg_signing
+        .as_ref()
+        .map(|cfg| IndexSigningConfig {
+            kind: "ed25519".to_string(),
+            public_keys: vec![IndexSigningPublicKey {
+                id: cfg.key_id.clone(),
+                ed25519_pub: cfg.ed25519_public_key_b64(),
+            }],
+        });
     let cfg = IndexConfig {
         dl: format!(
             "{}/v1/packages/",
@@ -2635,7 +2655,6 @@ async fn token_create(
     };
 
     let (token_id, token) = {
-        let mut rng = rand::rngs::OsRng;
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -2647,7 +2666,9 @@ async fn token_create(
                 );
             }
             let mut raw = [0u8; 32];
-            rng.fill_bytes(&mut raw);
+            if let Err(resp) = fill_secure_random(&mut raw) {
+                return resp;
+            }
             let token = format!("x07t_{}", sha256_hex(&raw));
             let token_hash = sha256_hex(token.as_bytes());
 

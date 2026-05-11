@@ -64,7 +64,10 @@ async fn main() {
                     message: "package signing is not enabled (hint: set X07_REGISTRY_PKG_SIGNING_ED25519_SECRET_B64 and X07_REGISTRY_PKG_SIGNING_KEY_ID before running this backfill)".to_string(),
                 }),
             };
-            println!("{}", serde_json::to_string_pretty(&resp).expect("serialize"));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).expect("serialize")
+            );
             std::process::exit(2);
         }
     };
@@ -82,7 +85,10 @@ async fn main() {
                     message,
                 }),
             };
-            println!("{}", serde_json::to_string_pretty(&resp).expect("serialize"));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&resp).expect("serialize")
+            );
             std::process::exit(1);
         }
     };
@@ -93,6 +99,8 @@ async fn main() {
         result: Some(report),
         error: None,
     };
-    println!("{}", serde_json::to_string_pretty(&resp).expect("serialize"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&resp).expect("serialize")
+    );
 }
-

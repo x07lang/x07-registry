@@ -2,7 +2,7 @@ use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH, LOCATION};
 use axum::http::{Request, StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
-use rand::RngCore;
+use rand::TryRngCore;
 use serde_json::Value;
 use std::collections::HashSet;
 use tower::ServiceExt;
@@ -42,7 +42,7 @@ async fn create_user_with_token(
 
     let github_user_id: i64 = {
         let mut raw = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         i64::from_le_bytes(raw).abs().max(1)
     };
 
@@ -70,7 +70,7 @@ async fn create_user_with_token(
 
     let token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07t_{}", sha256_hex(&raw))
     };
     let token_hash = sha256_hex(token.as_bytes());
@@ -106,13 +106,13 @@ async fn create_session_for_user(
 
     let session_token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07s_{}", sha256_hex(&raw))
     };
     let session_token_hash = sha256_hex(session_token.as_bytes());
     let csrf_token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07c_{}", sha256_hex(&raw))
     };
     let expires_at = Utc::now() + ChronoDuration::hours(1);
@@ -221,9 +221,9 @@ fn make_tar_with_package_with_modules(
     let mut meta_obj = meta
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    meta_obj.entry("x07c_compat".to_string()).or_insert_with(|| {
-        Value::String(">=0.1.111 <0.3.0".to_string())
-    });
+    meta_obj
+        .entry("x07c_compat".to_string())
+        .or_insert_with(|| Value::String(">=0.1.111 <0.3.0".to_string()));
     let mut manifest = serde_json::json!({
         "schema_version": "x07.package@0.1.0",
         "name": name,
@@ -678,7 +678,10 @@ async fn index_signing_backfill_restores_missing_entry_signatures() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = read_body_json(resp.into_body()).await;
-    let index_path = json["index_path"].as_str().expect("index_path str").to_string();
+    let index_path = json["index_path"]
+        .as_str()
+        .expect("index_path str")
+        .to_string();
 
     let pool = connect_test_db(&database_url, &database_schema).await;
     let cleared = sqlx::query(

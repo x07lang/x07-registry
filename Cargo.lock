@@ -3807,6 +3807,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
  "uuid",
  "x07-worlds",
  "x07c",

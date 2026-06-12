@@ -383,7 +383,21 @@
           "name": { "type": "string" },
           "version": { "type": "string" },
           "cksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-          "index_path": { "type": "string" }
+          "index_path": { "type": "string" },
+          "rdep_conflicts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RdepConflict" }
+          }
+        }
+      },
+      "RdepConflict": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["package", "version", "requirement"],
+        "properties": {
+          "package": { "type": "string" },
+          "version": { "type": "string" },
+          "requirement": { "type": "string" }
         }
       },
       "PackageMetadataResponse": {

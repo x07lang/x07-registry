@@ -158,9 +158,21 @@ fn base_config(
     }
 }
 
+fn default_module_bytes() -> Vec<u8> {
+    br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.3.0"}"#.to_vec()
+}
+
 fn make_tar_with_package(name: &str, version: &str) -> Vec<u8> {
-    let module_bytes = br#"{"decls":[{"kind":"export","names":["hello.util.answer"]},{"body":["bytes.alloc",0],"kind":"defn","name":"hello.util.answer","params":[],"result":"bytes"}],"imports":[],"kind":"module","module_id":"hello.util","schema_version":"x07.x07ast@0.3.0"}"#.to_vec();
-    make_tar_with_package_with_module(name, version, module_bytes)
+    make_tar_with_package_with_module(name, version, default_module_bytes())
+}
+
+fn make_tar_with_package_with_meta(name: &str, version: &str, meta: Value) -> Vec<u8> {
+    make_tar_with_package_with_modules(
+        name,
+        version,
+        Some(meta),
+        vec![("hello.util", default_module_bytes())],
+    )
 }
 
 fn make_tar_with_package_with_module(name: &str, version: &str, module_bytes: Vec<u8>) -> Vec<u8> {
@@ -221,9 +233,9 @@ fn make_tar_with_package_with_modules(
     let mut meta_obj = meta
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    meta_obj.entry("x07c_compat".to_string()).or_insert_with(|| {
-        Value::String(">=0.1.111 <0.3.0".to_string())
-    });
+    meta_obj
+        .entry("x07c_compat".to_string())
+        .or_insert_with(|| Value::String(">=0.1.111 <0.3.0".to_string()));
     let mut manifest = serde_json::json!({
         "schema_version": "x07.package@0.1.0",
         "name": name,
@@ -237,6 +249,23 @@ fn make_tar_with_package_with_modules(
     manifest["meta"] = Value::Object(meta_obj);
 
     make_tar_with_manifest_and_modules(manifest, modules)
+}
+
+async fn publish_ok(app: &axum::Router, token: &str, tar: Vec<u8>) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/packages/publish")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(tar))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_body_json(resp.into_body()).await
 }
 
 #[tokio::test]
@@ -678,7 +707,10 @@ async fn index_signing_backfill_restores_missing_entry_signatures() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = read_body_json(resp.into_body()).await;
-    let index_path = json["index_path"].as_str().expect("index_path str").to_string();
+    let index_path = json["index_path"]
+        .as_str()
+        .expect("index_path str")
+        .to_string();
 
     let pool = connect_test_db(&database_url, &database_schema).await;
     let cleared = sqlx::query(
@@ -730,7 +762,7 @@ async fn index_signing_backfill_restores_missing_entry_signatures() {
     assert_eq!(report.unsigned_before, 1);
     assert_eq!(report.unsigned_after, 0);
     assert_eq!(report.backfilled, 1);
-    assert_eq!(report.dry_run, false);
+    assert!(!report.dry_run);
 
     let index_json: Value = {
         let resp = app
@@ -1456,6 +1488,116 @@ async fn openapi_json_has_cache_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn publish_warns_on_rdep_exact_pin_conflict() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    let json = publish_ok(&app, &token, make_tar_with_package("rdep-base", "1.0.0")).await;
+    assert!(json.get("rdep_conflicts").is_none());
+
+    let json = publish_ok(
+        &app,
+        &token,
+        make_tar_with_package_with_meta(
+            "rdep-consumer",
+            "1.0.0",
+            serde_json::json!({ "requires_packages": ["rdep-base@1.0.0"] }),
+        ),
+    )
+    .await;
+    assert!(json.get("rdep_conflicts").is_none());
+
+    let json = publish_ok(&app, &token, make_tar_with_package("rdep-base", "1.1.0")).await;
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert_eq!(
+        json["rdep_conflicts"],
+        serde_json::json!([
+            { "package": "rdep-consumer", "version": "1.0.0", "requirement": "1.0.0" }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn publish_has_no_rdep_conflict_when_range_admits_new_version() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    publish_ok(&app, &token, make_tar_with_package("rdep-base", "1.0.0")).await;
+    publish_ok(
+        &app,
+        &token,
+        make_tar_with_package_with_meta(
+            "rdep-consumer",
+            "1.0.0",
+            serde_json::json!({ "requires_packages": ["rdep-base@>=1.0.0 <2.0.0"] }),
+        ),
+    )
+    .await;
+
+    let json = publish_ok(&app, &token, make_tar_with_package("rdep-base", "1.1.0")).await;
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert!(json.get("rdep_conflicts").is_none());
+}
+
+#[tokio::test]
+async fn publish_has_no_rdep_conflict_when_not_new_latest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (database_url, database_schema) = create_test_schema().await;
+    let app = x07_registry::app_with_config(base_config(
+        database_url.clone(),
+        database_schema.clone(),
+        x07_registry::RegistryStorageConfig::Filesystem {
+            data_dir: tmp.path().to_path_buf(),
+        },
+        Vec::new(),
+    ))
+    .await;
+
+    let token =
+        create_user_with_token(&database_url, &database_schema, "tester", &["publish"]).await;
+
+    publish_ok(&app, &token, make_tar_with_package("rdep-base", "2.0.0")).await;
+    publish_ok(
+        &app,
+        &token,
+        make_tar_with_package_with_meta(
+            "rdep-consumer",
+            "1.0.0",
+            serde_json::json!({ "requires_packages": ["rdep-base@2.0.0"] }),
+        ),
+    )
+    .await;
+
+    let json = publish_ok(&app, &token, make_tar_with_package("rdep-base", "1.5.0")).await;
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert!(json.get("rdep_conflicts").is_none());
 }
 
 #[tokio::test]

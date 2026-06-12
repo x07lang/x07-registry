@@ -320,7 +320,9 @@ fn validate_x07c_compat_req(raw: &str) -> Result<(), String> {
     if normalized.is_empty() {
         return Err("empty semver requirement".to_string());
     }
-    VersionReq::parse(&normalized).map(|_| ()).map_err(|e| e.to_string())
+    VersionReq::parse(&normalized)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -2068,13 +2070,17 @@ struct IndexConfig {
 }
 
 async fn index_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let signing = state.cfg.pkg_signing.as_ref().map(|cfg| IndexSigningConfig {
-        kind: "ed25519".to_string(),
-        public_keys: vec![IndexSigningPublicKey {
-            id: cfg.key_id.clone(),
-            ed25519_pub: cfg.ed25519_public_key_b64(),
-        }],
-    });
+    let signing = state
+        .cfg
+        .pkg_signing
+        .as_ref()
+        .map(|cfg| IndexSigningConfig {
+            kind: "ed25519".to_string(),
+            public_keys: vec![IndexSigningPublicKey {
+                id: cfg.key_id.clone(),
+                ed25519_pub: cfg.ed25519_public_key_b64(),
+            }],
+        });
     let cfg = IndexConfig {
         dl: format!(
             "{}/v1/packages/",
@@ -3126,7 +3132,7 @@ fn validate_scale_evidence_ref(cfg: &RegistryConfig, raw: &str) -> ApiResult<Str
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_facets_from_parts;
+    use super::{manifest_facets_from_parts, parse_rdep_requirement, rdep_requirement_satisfied};
     use serde_json::json;
 
     #[test]
@@ -3164,6 +3170,41 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn parses_rdep_requirements_and_checks_satisfaction() {
+        let exact = parse_rdep_requirement("1.2.3").expect("bare version");
+        assert!(rdep_requirement_satisfied((1, 2, 3), &exact));
+        assert!(!rdep_requirement_satisfied((1, 2, 4), &exact));
+
+        let exact = parse_rdep_requirement("=1.2.3").expect("explicit exact");
+        assert!(rdep_requirement_satisfied((1, 2, 3), &exact));
+        assert!(!rdep_requirement_satisfied((1, 3, 0), &exact));
+
+        let range = parse_rdep_requirement(">=1.2.3 <1.3.0").expect("space-separated range");
+        assert!(rdep_requirement_satisfied((1, 2, 3), &range));
+        assert!(rdep_requirement_satisfied((1, 2, 9), &range));
+        assert!(!rdep_requirement_satisfied((1, 3, 0), &range));
+        assert!(!rdep_requirement_satisfied((1, 2, 2), &range));
+
+        let range = parse_rdep_requirement(">=1.2.3, <1.3.0").expect("comma-separated range");
+        assert!(rdep_requirement_satisfied((1, 2, 5), &range));
+        assert!(!rdep_requirement_satisfied((1, 3, 0), &range));
+
+        let bounds = parse_rdep_requirement(">1.0.0 <=2.0.0").expect("strict bounds");
+        assert!(!rdep_requirement_satisfied((1, 0, 0), &bounds));
+        assert!(rdep_requirement_satisfied((2, 0, 0), &bounds));
+        assert!(!rdep_requirement_satisfied((2, 0, 1), &bounds));
+    }
+
+    #[test]
+    fn rejects_unparseable_rdep_requirements() {
+        assert!(parse_rdep_requirement("").is_none());
+        assert!(parse_rdep_requirement("not-a-version").is_none());
+        assert!(parse_rdep_requirement("1.2").is_none());
+        assert!(parse_rdep_requirement("~1.2.3").is_none());
+        assert!(parse_rdep_requirement(">=1.2.3 <nope").is_none());
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3173,6 +3214,183 @@ struct PublishResponse {
     version: String,
     cksum: String,
     index_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    rdep_conflicts: Vec<RdepConflict>,
+}
+
+#[derive(Debug, Serialize)]
+struct RdepConflict {
+    package: String,
+    version: String,
+    requirement: String,
+}
+
+fn parse_semver_triple(raw: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = raw.trim().splitn(3, '.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RdepReqOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RdepReqClause {
+    op: RdepReqOp,
+    version: (u64, u64, u64),
+}
+
+/// Parses a `requires_packages` version requirement, mirroring x07's
+/// `parse_semver_req`: clauses are separated by whitespace (trailing commas
+/// trimmed), each clause is an optional prefix op (`>=`, `<=`, `>`, `<`, `=`)
+/// followed by MAJOR.MINOR.PATCH, and a bare version means exact equality.
+fn parse_rdep_requirement(raw: &str) -> Option<Vec<RdepReqClause>> {
+    let mut out = Vec::new();
+    for tok in raw.split_whitespace() {
+        let tok = tok.trim_end_matches(',');
+        if tok.is_empty() {
+            continue;
+        }
+        let (op, version_raw) = if let Some(v) = tok.strip_prefix(">=") {
+            (RdepReqOp::Ge, v)
+        } else if let Some(v) = tok.strip_prefix("<=") {
+            (RdepReqOp::Le, v)
+        } else if let Some(v) = tok.strip_prefix('>') {
+            (RdepReqOp::Gt, v)
+        } else if let Some(v) = tok.strip_prefix('<') {
+            (RdepReqOp::Lt, v)
+        } else if let Some(v) = tok.strip_prefix('=') {
+            (RdepReqOp::Eq, v)
+        } else {
+            (RdepReqOp::Eq, tok)
+        };
+        let version = parse_semver_triple(version_raw)?;
+        out.push(RdepReqClause { op, version });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn rdep_requirement_satisfied(version: (u64, u64, u64), req: &[RdepReqClause]) -> bool {
+    req.iter().all(|clause| match clause.op {
+        RdepReqOp::Lt => version < clause.version,
+        RdepReqOp::Le => version <= clause.version,
+        RdepReqOp::Gt => version > clause.version,
+        RdepReqOp::Ge => version >= clause.version,
+        RdepReqOp::Eq => version == clause.version,
+    })
+}
+
+/// Finds reverse dependencies whose latest non-yanked version declares a
+/// `meta.requires_packages` requirement on the just-published package that the
+/// new version does not satisfy. Best-effort warnings only: any failure yields
+/// an empty list so a publish never fails because of this check.
+async fn compute_rdep_conflicts(
+    db: &PgPool,
+    published_package_id: Uuid,
+    published_name: &str,
+    published_version: (u64, u64, u64),
+) -> Vec<RdepConflict> {
+    #[derive(sqlx::FromRow)]
+    struct CandidateRow {
+        name: String,
+        latest_version: Option<String>,
+        version: String,
+        requires: serde_json::Value,
+    }
+
+    let like_pattern = format!(
+        "{}@%",
+        published_name
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let rows: Vec<CandidateRow> = match sqlx::query_as(
+        "SELECT p.name AS name, p.latest_version AS latest_version, pv.version AS version, \
+         pv.manifest->'meta'->'requires_packages' AS requires \
+         FROM package_versions pv \
+         JOIN packages p ON p.id = pv.package_id \
+         WHERE p.id <> $1 \
+         AND pv.yanked = false \
+         AND jsonb_typeof(pv.manifest->'meta'->'requires_packages') = 'array' \
+         AND EXISTS (\
+             SELECT 1 FROM jsonb_array_elements_text(pv.manifest->'meta'->'requires_packages') AS req(entry) \
+             WHERE req.entry LIKE $2\
+         )",
+    )
+    .bind(published_package_id)
+    .bind(&like_pattern)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!("rdep conflict check: select candidates: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut best: HashMap<String, ((u64, u64, u64), CandidateRow)> = HashMap::new();
+    for row in rows {
+        let Some(version) = parse_semver_triple(&row.version) else {
+            continue;
+        };
+        match best.get(&row.name) {
+            Some((cur, _)) if *cur >= version => {}
+            _ => {
+                best.insert(row.name.clone(), (version, row));
+            }
+        }
+    }
+
+    let entry_prefix = format!("{published_name}@");
+    let mut conflicts = Vec::new();
+    for (version, row) in best.into_values() {
+        // If the rdep has a newer non-yanked version that no longer requires
+        // the published package, its latest resolution is unaffected.
+        if let Some(latest) = row.latest_version.as_deref().and_then(parse_semver_triple) {
+            if latest > version {
+                continue;
+            }
+        }
+        let Some(requirement) = row.requires.as_array().and_then(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .find_map(|entry| entry.strip_prefix(&entry_prefix))
+        }) else {
+            continue;
+        };
+        let Some(clauses) = parse_rdep_requirement(requirement) else {
+            tracing::warn!(
+                "rdep conflict check: unparseable requirement {requirement:?} in {}@{}",
+                row.name,
+                row.version
+            );
+            continue;
+        };
+        if !rdep_requirement_satisfied(published_version, &clauses) {
+            conflicts.push(RdepConflict {
+                package: row.name,
+                version: row.version,
+                requirement: requirement.to_string(),
+            });
+        }
+    }
+    conflicts.sort_by(|a, b| a.package.cmp(&b.package));
+    conflicts
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3612,12 +3830,27 @@ async fn publish(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
         );
     }
 
+    // Reverse-dependency conflict check (warnings only). Only relevant when
+    // the published version became the new latest: rdeps resolving latest are
+    // unaffected otherwise.
+    let rdep_conflicts = if should_update_latest {
+        match parse_semver_triple(pkg_version) {
+            Some(published) => {
+                compute_rdep_conflicts(&state.db, package_id, pkg_name, published).await
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     ok_json(PublishResponse {
         ok: true,
         name: manifest.name,
         version: manifest.version,
         cksum,
         index_path: format!("/index/{index_rel}"),
+        rdep_conflicts,
     })
 }
 

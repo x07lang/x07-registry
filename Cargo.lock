@@ -53,7 +53,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -64,7 +64,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3779,8 +3779,8 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "x07-contracts"
-version = "0.2.16"
-source = "git+https://github.com/x07lang/x07?tag=v0.2.16#cb92d95bdf0ef9cbdc2e1f66cbbc69c06d67f677"
+version = "0.2.17"
+source = "git+https://github.com/x07lang/x07?tag=v0.2.17#8e2baf175a556d02627b8aaa3bc0f4124b61e91f"
 
 [[package]]
 name = "x07-registry"
@@ -3815,16 +3815,16 @@ dependencies = [
 
 [[package]]
 name = "x07-worlds"
-version = "0.2.16"
-source = "git+https://github.com/x07lang/x07?tag=v0.2.16#cb92d95bdf0ef9cbdc2e1f66cbbc69c06d67f677"
+version = "0.2.17"
+source = "git+https://github.com/x07lang/x07?tag=v0.2.17#8e2baf175a556d02627b8aaa3bc0f4124b61e91f"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "x07c"
-version = "0.2.16"
-source = "git+https://github.com/x07lang/x07?tag=v0.2.16#cb92d95bdf0ef9cbdc2e1f66cbbc69c06d67f677"
+version = "0.2.17"
+source = "git+https://github.com/x07lang/x07?tag=v0.2.17#8e2baf175a556d02627b8aaa3bc0f4124b61e91f"
 dependencies = [
  "anyhow",
  "blake3",

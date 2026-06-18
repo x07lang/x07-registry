@@ -2,7 +2,7 @@ use axum::http::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH, LOCATION};
 use axum::http::{Request, StatusCode};
 use chrono::{Duration as ChronoDuration, Utc};
 use http_body_util::BodyExt;
-use rand::RngCore;
+use rand::TryRngCore;
 use serde_json::Value;
 use std::collections::HashSet;
 use tower::ServiceExt;
@@ -42,7 +42,7 @@ async fn create_user_with_token(
 
     let github_user_id: i64 = {
         let mut raw = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         i64::from_le_bytes(raw).abs().max(1)
     };
 
@@ -70,7 +70,7 @@ async fn create_user_with_token(
 
     let token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07t_{}", sha256_hex(&raw))
     };
     let token_hash = sha256_hex(token.as_bytes());
@@ -106,13 +106,13 @@ async fn create_session_for_user(
 
     let session_token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07s_{}", sha256_hex(&raw))
     };
     let session_token_hash = sha256_hex(session_token.as_bytes());
     let csrf_token = {
         let mut raw = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut raw);
+        rand::rngs::OsRng.try_fill_bytes(&mut raw).expect("os rng");
         format!("x07c_{}", sha256_hex(&raw))
     };
     let expires_at = Utc::now() + ChronoDuration::hours(1);
